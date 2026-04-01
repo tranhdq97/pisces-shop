@@ -1,0 +1,36 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: pisces-shop-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pisces_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pisces_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pisces_db"]
+      interval: 3s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pisces-shop-web
+    ports:
+      - "8001:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/pisces_db
+    env_file:
+      - compose.env
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pisces_pgdata:
