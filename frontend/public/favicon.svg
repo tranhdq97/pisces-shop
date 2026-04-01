@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Body -->
+  <ellipse cx="30" cy="32" rx="20" ry="13" fill="#3b82f6"/>
+  <!-- Tail fin -->
+  <path d="M50 32 L62 20 L62 44 Z" fill="#2563eb"/>
+  <!-- Eye -->
+  <circle cx="18" cy="28" r="3" fill="white"/>
+  <circle cx="17.5" cy="27.5" r="1.4" fill="#1e3a8a"/>
+  <!-- Top fin -->
+  <path d="M24 19 Q30 12 38 18" stroke="#2563eb" stroke-width="3" stroke-linecap="round" fill="none"/>
+</svg>
