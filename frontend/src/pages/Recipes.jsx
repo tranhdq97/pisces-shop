@@ -1,13 +1,13 @@
 import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ChefHat, Plus, Trash2 } from 'lucide-react'
+import { ChefHat, Plus, Trash2, CheckCircle2, Circle } from 'lucide-react'
 import Layout from '../components/Layout'
 import Modal from '../components/Modal'
 import Button from '../components/Button'
 import Spinner from '../components/Spinner'
 import { getItems, getCategories, updateItem } from '../api/menu'
 import { getInventoryItems } from '../api/inventory'
-import { getRecipe, setRecipe, deleteRecipe, getRecipeCost } from '../api/recipes'
+import { getRecipes, getRecipe, setRecipe, deleteRecipe, getRecipeCost } from '../api/recipes'
 import { useT } from '../i18n'
 import { useAuth } from '../hooks/useAuth'
 import { apiErr } from '../api/apiErr'
@@ -20,6 +20,7 @@ export default function Recipes() {
 
   const [editItem, setEditItem] = useState(null)
   const [activeTab, setActiveTab] = useState('ingredients')
+  const [activeCategory, setActiveCategory] = useState('__all__')
   const [ingredients, setIngredients] = useState([])
   const [steps, setSteps] = useState([])
   const [prepForm, setPrepForm] = useState({ prep_complexity: '', prep_minutes: '' })
@@ -35,6 +36,14 @@ export default function Recipes() {
     queryFn: getCategories,
   })
   const catMap = Object.fromEntries(categories.map((c) => [c.id, c.name]))
+
+  const { data: recipes = [] } = useQuery({
+    queryKey: ['recipes-all'],
+    queryFn: getRecipes,
+  })
+  const recipeStatus = new Map(
+    recipes.map((r) => [r.menu_item_id, (r.ingredients?.length ?? 0) > 0 || (r.steps?.length ?? 0) > 0]),
+  )
 
   const { data: stockItems = [] } = useQuery({
     queryKey: ['inventory-items'],
@@ -59,6 +68,8 @@ export default function Recipes() {
         stock_item_id: i.stock_item_id,
         quantity: String(i.quantity),
         notes: i.notes ?? '',
+        substitute_group: i.substitute_group != null ? String(i.substitute_group) : '',
+        priority: i.substitute_group != null ? String(i.priority ?? 0) : '0',
       })))
       setSteps(recipe.steps.map((s) => ({ description: s.description })))
     }
@@ -72,6 +83,8 @@ export default function Recipes() {
           stock_item_id: i.stock_item_id,
           quantity: Number(i.quantity),
           notes: i.notes || null,
+          substitute_group: i.substitute_group !== '' ? Number(i.substitute_group) : null,
+          priority: i.substitute_group !== '' ? Number(i.priority || 0) : 0,
         })),
       steps: stps
         .filter((s) => s.description.trim())
@@ -79,6 +92,7 @@ export default function Recipes() {
     }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['recipe', editItem?.id] })
+      qc.invalidateQueries({ queryKey: ['recipes-all'] })
       setEditItem(null)
     },
     onError: (e) => setMutErr(apiErr(e, t)),
@@ -88,6 +102,7 @@ export default function Recipes() {
     mutationFn: (itemId) => deleteRecipe(itemId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['recipe', editItem?.id] })
+      qc.invalidateQueries({ queryKey: ['recipes-all'] })
       setEditItem(null)
     },
     onError: (e) => setMutErr(apiErr(e, t)),
@@ -118,10 +133,34 @@ export default function Recipes() {
   }
 
   // Ingredient handlers
-  const addRow = () => setIngredients((prev) => [...prev, { stock_item_id: '', quantity: '', notes: '' }])
+  const addRow = () => setIngredients((prev) => [...prev, { stock_item_id: '', quantity: '', notes: '', substitute_group: '', priority: '0' }])
+  const addOrRow = (groupNum) => setIngredients((prev) => {
+    const next = prev.map((row) => ({ ...row }))
+    const ungrouped = next.filter((r) => r.substitute_group === '')
+    if (ungrouped.length === 1) {
+      const idx = next.findIndex((r) => r.substitute_group === '')
+      next[idx] = { ...next[idx], substitute_group: String(groupNum), priority: '0' }
+    }
+    const inGroup = next.filter((r) => r.substitute_group === String(groupNum)).length
+    next.push({
+      stock_item_id: '',
+      quantity: ungrouped.length === 1 ? (ungrouped[0].quantity || '1') : '1',
+      notes: '',
+      substitute_group: String(groupNum),
+      priority: String(inGroup),
+    })
+    return next
+  })
   const removeRow = (i) => setIngredients((prev) => prev.filter((_, idx) => idx !== i))
   const updateRow = (i, field, val) =>
     setIngredients((prev) => prev.map((row, idx) => idx === i ? { ...row, [field]: val } : row))
+
+  const nextOrGroup = () => {
+    const nums = ingredients
+      .map((i) => (i.substitute_group !== '' ? Number(i.substitute_group) : null))
+      .filter((n) => n != null && !Number.isNaN(n))
+    return nums.length ? Math.max(...nums) + 1 : 1
+  }
 
   // Step handlers
   const addStep = () => setSteps((prev) => [...prev, { description: '' }])
@@ -130,6 +169,15 @@ export default function Recipes() {
     setSteps((prev) => prev.map((s, idx) => idx === i ? { description: val } : s))
 
   if (menuLoading) return <Layout title={t('recipes.title')}><Spinner /></Layout>
+
+  const allItemsSorted = [...menuItems].sort((a, b) => (a.name || '').localeCompare((b.name || ''), 'vi'))
+  const itemsByCat = (catId) =>
+    catId === '__all__' ? allItemsSorted : allItemsSorted.filter((i) => i.category_id === catId)
+  const allCategoriesForTabs = [
+    { id: '__all__', name: t('dash.all_categories') ?? t('common.all') ?? 'Tất cả' },
+    ...categories.map((c) => ({ id: c.id, name: c.name })),
+  ]
+  const visibleItems = itemsByCat(activeCategory)
 
   return (
     <Layout title={t('recipes.title')}>
@@ -143,37 +191,75 @@ export default function Recipes() {
       {menuItems.length === 0 ? (
         <div className="text-center py-20 text-muted text-sm">{t('recipes.no_items')}</div>
       ) : (
-        <div className="bg-card rounded-xl border border-border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b border-border bg-slate-50 text-xs font-semibold text-muted uppercase tracking-wide">
-              <tr>
-                <th className="px-4 py-3 text-left">{t('common.name')}</th>
-                <th className="px-4 py-3 text-left hidden sm:table-cell">{t('common.category')}</th>
-                <th className="px-4 py-3 text-left hidden md:table-cell">{t('recipes.prep_complexity')}</th>
-                <th className="px-4 py-3 text-right">{t('recipes.col_recipe')}</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-border">
-              {menuItems.map((item) => (
-                <tr key={item.id} className="hover:bg-slate-50 transition-colors">
-                  <td className="px-4 py-3 font-medium text-slate-800">{item.name}</td>
-                  <td className="px-4 py-3 text-muted hidden sm:table-cell">{catMap[item.category_id] ?? '—'}</td>
-                  <td className="px-4 py-3 hidden md:table-cell">
-                    <ComplexityBadge complexity={item.prep_complexity} minutes={item.prep_minutes} t={t} />
-                  </td>
-                  <td className="px-4 py-3 text-right">
-                    <button
-                      onClick={() => openEdit(item)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-brand-50 text-brand-600 hover:bg-brand-100 transition-colors"
-                    >
-                      <ChefHat size={13} />
-                      {canEdit ? t('recipes.edit_btn') : t('recipes.view_btn')}
-                    </button>
-                  </td>
+        <div className="space-y-3">
+          {/* Category tabs */}
+          <div className="flex gap-2 overflow-x-auto pb-1">
+            {allCategoriesForTabs.map((c) => {
+              const count = itemsByCat(c.id).length
+              const isActive = activeCategory === c.id
+              return (
+                <button
+                  key={c.id}
+                  onClick={() => setActiveCategory(c.id)}
+                  className={`flex-shrink-0 inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-sm border transition-colors ${
+                    isActive
+                      ? 'bg-brand-500 text-white border-brand-500'
+                      : 'bg-white text-slate-700 border-border hover:bg-slate-50'
+                  }`}
+                >
+                  <span className="whitespace-nowrap">{c.name}</span>
+                  <span className={`text-xs rounded-full px-2 py-0.5 ${isActive ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-600'}`}>
+                    {count}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+
+          <div className="bg-card rounded-xl border border-border overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="border-b border-border bg-slate-50 text-xs font-semibold text-muted uppercase tracking-wide">
+                <tr>
+                  <th className="px-4 py-3 text-left">{t('common.name')}</th>
+                  <th className="px-4 py-3 text-left hidden sm:table-cell">{t('common.category')}</th>
+                  <th className="px-4 py-3 text-left hidden md:table-cell">{t('recipes.prep_complexity')}</th>
+                  <th className="px-4 py-3 text-right">{t('recipes.col_recipe')}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {visibleItems.map((item) => {
+                  const hasRecipe = recipeStatus.get(item.id) === true
+                  return (
+                    <tr key={item.id} className="hover:bg-slate-50 transition-colors">
+                      <td className="px-4 py-3 font-medium text-slate-800">
+                        <div className="flex items-center gap-2">
+                          {hasRecipe ? (
+                            <CheckCircle2 size={16} className="text-emerald-600 flex-shrink-0" title="Đã setup công thức" />
+                          ) : (
+                            <Circle size={16} className="text-slate-300 flex-shrink-0" title="Chưa setup công thức" />
+                          )}
+                          <span>{item.name}</span>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3 text-muted hidden sm:table-cell">{catMap[item.category_id] ?? '—'}</td>
+                      <td className="px-4 py-3 hidden md:table-cell">
+                        <ComplexityBadge complexity={item.prep_complexity} minutes={item.prep_minutes} t={t} />
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          onClick={() => openEdit(item)}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-brand-50 text-brand-600 hover:bg-brand-100 transition-colors"
+                        >
+                          <ChefHat size={13} />
+                          {canEdit ? t('recipes.edit_btn') : t('recipes.view_btn')}
+                        </button>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
@@ -225,6 +311,7 @@ export default function Recipes() {
                 stockItems={stockItems}
                 canEdit={canEdit}
                 onAdd={addRow}
+                onAddOr={() => addOrRow(nextOrGroup())}
                 onRemove={removeRow}
                 onUpdate={updateRow}
                 t={t}
@@ -346,68 +433,113 @@ function RecipeCostViewer({ cost, t }) {
   )
 }
 
-function RecipeIngredientEditor({ ingredients, stockItems, canEdit, onAdd, onRemove, onUpdate, t }) {
+function RecipeIngredientEditor({ ingredients, stockItems, canEdit, onAdd, onAddOr, onRemove, onUpdate, t }) {
   return (
     <div className="space-y-3">
       {ingredients.length === 0 && (
         <p className="text-sm text-center text-muted py-4">{t('recipes.no_ingredients')}</p>
       )}
-      {ingredients.map((row, i) => (
-        <div key={i} className="flex items-end gap-2">
-          <div className="flex-1">
-            <label className="block text-xs font-medium text-slate-600 mb-1">{t('recipes.stock_item')}</label>
-            <select
-              className="w-full rounded-lg border border-border px-3 py-2 text-sm outline-none focus:border-brand-500 bg-white disabled:bg-slate-50"
-              value={row.stock_item_id}
-              onChange={(e) => onUpdate(i, 'stock_item_id', e.target.value)}
-              disabled={!canEdit}
-            >
-              <option value="">{t('recipes.select_item')}</option>
-              {stockItems.map((s) => (
-                <option key={s.id} value={s.id}>{s.name} ({s.unit})</option>
-              ))}
-            </select>
+      {ingredients.map((row, i) => {
+        const prevGroup = i > 0 ? ingredients[i - 1].substitute_group : ''
+        const showOrBadge = row.substitute_group !== '' && row.substitute_group === prevGroup
+        return (
+          <div key={i}>
+            {showOrBadge && (
+              <div className="flex items-center gap-2 py-1 pl-1">
+                <span className="text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-0.5">
+                  {t('recipes.or_badge')}
+                </span>
+              </div>
+            )}
+            <div className={`flex items-end gap-2 ${row.substitute_group !== '' ? 'pl-3 border-l-2 border-amber-300' : ''}`}>
+              <div className="flex-1 min-w-0">
+                <label className="block text-xs font-medium text-slate-600 mb-1">{t('recipes.stock_item')}</label>
+                <select
+                  className="w-full rounded-lg border border-border px-3 py-2 text-sm outline-none focus:border-brand-500 bg-white disabled:bg-slate-50"
+                  value={row.stock_item_id}
+                  onChange={(e) => onUpdate(i, 'stock_item_id', e.target.value)}
+                  disabled={!canEdit}
+                >
+                  <option value="">{t('recipes.select_item')}</option>
+                  {stockItems.map((s) => (
+                    <option key={s.id} value={s.id}>{s.name} ({s.unit})</option>
+                  ))}
+                </select>
+              </div>
+              <div className="w-20">
+                <label className="block text-xs font-medium text-slate-600 mb-1">{t('recipes.qty')}</label>
+                <input
+                  type="number" min="0" step="any"
+                  className="w-full rounded-lg border border-border px-2 py-2 text-sm outline-none focus:border-brand-500"
+                  value={row.quantity}
+                  onChange={(e) => onUpdate(i, 'quantity', e.target.value)}
+                  disabled={!canEdit}
+                />
+              </div>
+              <div className="w-16">
+                <label className="block text-xs font-medium text-slate-600 mb-1" title={t('recipes.or_group_ph')}>{t('recipes.or_group')}</label>
+                <input
+                  type="number" min="1" step="1"
+                  placeholder="—"
+                  className="w-full rounded-lg border border-border px-2 py-2 text-sm outline-none focus:border-brand-500"
+                  value={row.substitute_group}
+                  onChange={(e) => onUpdate(i, 'substitute_group', e.target.value)}
+                  disabled={!canEdit}
+                />
+              </div>
+              {row.substitute_group !== '' && (
+                <div className="w-14">
+                  <label className="block text-xs font-medium text-slate-600 mb-1" title={t('recipes.priority_hint')}>{t('recipes.priority')}</label>
+                  <input
+                    type="number" min="0" step="1"
+                    className="w-full rounded-lg border border-border px-2 py-2 text-sm outline-none focus:border-brand-500"
+                    value={row.priority}
+                    onChange={(e) => onUpdate(i, 'priority', e.target.value)}
+                    disabled={!canEdit}
+                  />
+                </div>
+              )}
+              <div className="flex-1 min-w-0 hidden lg:block">
+                <label className="block text-xs font-medium text-slate-600 mb-1">{t('recipes.notes')}</label>
+                <input
+                  type="text"
+                  className="w-full rounded-lg border border-border px-3 py-2 text-sm outline-none focus:border-brand-500"
+                  value={row.notes}
+                  placeholder={t('recipes.notes_ph')}
+                  onChange={(e) => onUpdate(i, 'notes', e.target.value)}
+                  disabled={!canEdit}
+                />
+              </div>
+              {canEdit && (
+                <button
+                  type="button"
+                  onClick={() => onRemove(i)}
+                  className="mb-0.5 p-2 rounded-lg hover:bg-red-50 text-muted hover:text-red-500"
+                >
+                  <Trash2 size={14} />
+                </button>
+              )}
+            </div>
           </div>
-          <div className="w-24">
-            <label className="block text-xs font-medium text-slate-600 mb-1">{t('recipes.qty')}</label>
-            <input
-              type="number" min="0" step="any"
-              className="w-full rounded-lg border border-border px-3 py-2 text-sm outline-none focus:border-brand-500"
-              value={row.quantity}
-              onChange={(e) => onUpdate(i, 'quantity', e.target.value)}
-              disabled={!canEdit}
-            />
-          </div>
-          <div className="flex-1">
-            <label className="block text-xs font-medium text-slate-600 mb-1">{t('recipes.notes')}</label>
-            <input
-              type="text"
-              className="w-full rounded-lg border border-border px-3 py-2 text-sm outline-none focus:border-brand-500"
-              value={row.notes}
-              placeholder={t('recipes.notes_ph')}
-              onChange={(e) => onUpdate(i, 'notes', e.target.value)}
-              disabled={!canEdit}
-            />
-          </div>
-          {canEdit && (
-            <button
-              type="button"
-              onClick={() => onRemove(i)}
-              className="mb-0.5 p-2 rounded-lg hover:bg-red-50 text-muted hover:text-red-500"
-            >
-              <Trash2 size={14} />
-            </button>
-          )}
-        </div>
-      ))}
+        )
+      })}
       {canEdit && (
-        <button
-          type="button"
-          onClick={onAdd}
-          className="flex items-center gap-1.5 text-xs text-brand-600 hover:text-brand-700 font-medium"
-        >
-          <Plus size={14} /> {t('recipes.add_ingredient')}
-        </button>
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={onAdd}
+            className="flex items-center gap-1.5 text-xs text-brand-600 hover:text-brand-700 font-medium"
+          >
+            <Plus size={14} /> {t('recipes.add_ingredient')}
+          </button>
+          <button
+            type="button"
+            onClick={onAddOr}
+            className="flex items-center gap-1.5 text-xs text-amber-700 hover:text-amber-800 font-medium"
+          >
+            <Plus size={14} /> {t('recipes.add_or_alternative')}
+          </button>
+        </div>
       )}
     </div>
   )

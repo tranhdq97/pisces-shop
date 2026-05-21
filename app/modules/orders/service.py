@@ -1,5 +1,4 @@
 import uuid
-from collections import defaultdict
 from datetime import date
 
 from sqlalchemy import func, select
@@ -19,10 +18,23 @@ from app.modules.orders.schemas import (
     OrderUpdateItems,
     OrderUpdateStatus,
 )
+from app.modules.orders.ingredients import (
+    build_adjustment_snapshot,
+    build_resolved_ingredients_snapshot,
+    ingredient_demand_from_detail,
+    load_recipe_lines,
+    resolve_effective_quantities,
+)
 from app.modules.orders.totals import validate_stored_discount
 from app.modules.orders.shop_settings_service import ShopSettingsService
-from app.modules.recipes.availability import assert_menu_items_have_stock_for_quantities
-from app.modules.recipes.models import RecipeItem
+from app.modules.recipes.availability import plan_order_lines_demand, raise_insufficient_ingredients
+from app.modules.recipes.substitutes import (
+    load_recipe_lines_with_stock,
+    load_stock_balances,
+    partition_recipe_for_availability,
+    simulate_line_demand,
+)
+from app.modules.orders.ingredients import resolve_effective_quantities as resolve_qty
 from app.modules.tables.models import Table
 
 
@@ -36,12 +48,9 @@ class OrderService:
 
     async def _lock_details(self, items: list, *, locale: str = "en") -> list[dict]:
         """Validate each item_id against available menu items, stock vs recipes, and lock prices."""
-        qty_by_item: dict[uuid.UUID, int] = defaultdict(int)
-        for item_req in items:
-            qty_by_item[item_req.item_id] += item_req.qty
-
         menu_by_id: dict[uuid.UUID, MenuItem] = {}
-        for item_id in qty_by_item:
+        item_ids = list(dict.fromkeys(item_req.item_id for item_req in items))
+        for item_id in item_ids:
             result = await self._db.execute(
                 select(MenuItem).where(
                     MenuItem.id == item_id,
@@ -57,13 +66,29 @@ class OrderService:
                 )
             menu_by_id[item_id] = menu_item
 
-        await assert_menu_items_have_stock_for_quantities(self._db, qty_by_item, locale=locale)
+        recipe_by_item: dict[uuid.UUID, list] = {}
+        plan_lines: list[tuple[uuid.UUID, int, list | None]] = []
+        for item_req in items:
+            if item_req.item_id not in recipe_by_item:
+                recipe_by_item[item_req.item_id] = await load_recipe_lines(self._db, item_req.item_id)
+            plan_lines.append((item_req.item_id, item_req.qty, item_req.ingredient_adjustments))
+
+        per_line_demand, shortages = await plan_order_lines_demand(self._db, plan_lines)
+        if shortages:
+            raise_insufficient_ingredients(shortages, locale=locale)
 
         locked: list[dict] = []
-        for item_req in items:
+        for item_req, line_demand in zip(items, per_line_demand, strict=True):
             menu_item = menu_by_id[item_req.item_id]
             unit_price = float(menu_item.price)
-            locked.append({
+            recipe_lines = recipe_by_item[item_req.item_id]
+            effective = resolve_effective_quantities(recipe_lines, item_req.ingredient_adjustments)
+
+            stock_meta: dict[uuid.UUID, tuple[str, str]] = {}
+            for line in recipe_lines:
+                stock_meta[line.stock_item_id] = (line.stock_item.name, line.stock_item.unit)
+
+            line: dict = {
                 "item_id": str(item_req.item_id),
                 "name": menu_item.name,
                 "qty": item_req.qty,
@@ -73,7 +98,14 @@ class OrderService:
                 "prep_minutes": menu_item.prep_minutes,
                 "served_qty": 0,
                 "served_by": None,
-            })
+            }
+            snapshot = build_adjustment_snapshot(recipe_lines, effective)
+            if snapshot:
+                line["ingredient_adjustments"] = snapshot
+            resolved = build_resolved_ingredients_snapshot(line_demand, stock_meta)
+            if resolved:
+                line["resolved_ingredients"] = resolved
+            locked.append(line)
         return locked
 
     async def _inventory_apply_for_details(
@@ -93,18 +125,28 @@ class OrderService:
             menu_item_id = uuid.UUID(item_detail["item_id"])
             ordered_qty = int(item_detail["qty"])
 
-            recipe_result = await self._db.execute(
-                select(RecipeItem)
-                .options(selectinload(RecipeItem.stock_item))
-                .where(RecipeItem.menu_item_id == menu_item_id)
-            )
-            recipe_items = recipe_result.scalars().all()
+            stored_demand = ingredient_demand_from_detail(item_detail, ordered_qty=ordered_qty)
+            if stored_demand:
+                effective = stored_demand
+            else:
+                recipe_items = await load_recipe_lines_with_stock(self._db, menu_item_id)
+                if not recipe_items:
+                    continue
 
-            for recipe_item in recipe_items:
-                total = float(recipe_item.quantity) * ordered_qty
-                delta = -total if deduct else total
+                stock_ids = {line.stock_item_id for line in recipe_items}
+                stock_bal = await load_stock_balances(self._db, stock_ids)
+                effective_qty = resolve_qty(recipe_items, None)
+                and_lines, or_groups = partition_recipe_for_availability(recipe_items, effective_qty)
+                effective, _ = simulate_line_demand(
+                    and_lines, or_groups, ordered_qty, stock_bal
+                )
+
+            for stock_item_id, total_qty in effective.items():
+                if total_qty <= 1e-12:
+                    continue
+                delta = -total_qty if deduct else total_qty
                 await inv_service.add_entry(
-                    recipe_item.stock_item_id,
+                    stock_item_id,
                     StockEntryCreate(
                         quantity=delta,
                         note=_order_inventory_note(order_id, action),
@@ -172,6 +214,26 @@ class OrderService:
         await self._inventory_apply_for_details(locked_details, order.id, deduct=True)
         await self._db.flush()
         await self._db.refresh(order)
+
+        if flow == OrderFlow.TAKEAWAY:
+            from app.modules.cashier.service import CashierService
+
+            if payload.payment_method is None:
+                raise AppException(
+                    status_code=422,
+                    detail="Takeaway orders require payment_method (open cashier shift first).",
+                    code="takeaway_payment_required",
+                )
+            cashier = CashierService(self._db)
+            shift = await cashier.require_open_shift()
+            await cashier.record_payment(
+                shift=shift,
+                orders=[order],
+                payment_method=payload.payment_method.value,
+                cash_amount=payload.cash_amount,
+                table_id=None,
+                table_name=None,
+            )
 
         result = await self._db.execute(
             select(Order).where(Order.id == order.id).options(selectinload(Order.table))

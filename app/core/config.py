@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     # Security
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 240  # 4 hours — staff tablets/phones stay signed in
 
     # Public landing media uploads (superadmin). Whole number of mebibytes (MiB).
     ABOUT_UPLOAD_MAX_MIB: int = 250

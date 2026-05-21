@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
+import { Link } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Plus, Clock, Utensils, ChefHat, Ban, Pencil, User, Truck, Trash2, Download, CheckCircle2, Settings, Tag } from 'lucide-react'
+import { Plus, Clock, Utensils, ChefHat, Ban, Pencil, User, Truck, Trash2, Download, CheckCircle2, Settings, Tag, Banknote } from 'lucide-react'
 import Layout from '../components/Layout'
 import Modal from '../components/Modal'
 import Button from '../components/Button'
@@ -8,9 +9,12 @@ import Badge from '../components/Badge'
 import Input from '../components/Input'
 import MoneyInput from '../components/MoneyInput'
 import Spinner from '../components/Spinner'
-import { getOrders, getOrderFormDefaults, patchOrderFormDefaults, createOrder, updateStatus, updateOrderItems, deleteOrder, serveOrderItem, patchOrderDiscount } from '../api/orders'
+import { getOrders, getOrderFormDefaults, patchOrderFormDefaults, createOrder, updateStatus, updateOrderItems, deleteOrder, serveOrderItem, patchOrderDiscount, getOrderPayment } from '../api/orders'
+import { updatePayment } from '../api/cashier'
 import { getCategories, getItems } from '../api/menu'
+import { getRecipe } from '../api/recipes'
 import { getTables } from '../api/tables'
+import { getCurrentShift } from '../api/cashier'
 import { getAllUsers } from '../api/auth'
 import { useT } from '../i18n'
 import { useAuth } from '../hooks/useAuth'
@@ -52,7 +56,69 @@ function orderTotals(order) {
   return { subtotal, discountAmount: 0, total: subtotal, hasDiscount: false }
 }
 
-/** Cap cart qty to per-item max_orderable_qty (min over recipe lines vs stock). */
+/** Cart line: { qty, ingredientAdjustments?: { [stockItemId]: number } } */
+function cartEntryQty(cart, id) {
+  const e = cart[id]
+  if (!e) return 0
+  return typeof e === 'number' ? e : (e.qty ?? 0)
+}
+
+function setCartEntryQty(cart, id, qty) {
+  const prev = cart[id]
+  const extras = typeof prev === 'object' && prev ? { ingredientAdjustments: prev.ingredientAdjustments } : {}
+  if (qty <= 0) {
+    const { [id]: _, ...rest } = cart
+    return rest
+  }
+  if (typeof prev === 'object' && prev) return { ...cart, [id]: { ...prev, qty } }
+  return { ...cart, [id]: { qty, ...extras } }
+}
+
+function cartToDetails(cart) {
+  return Object.entries(cart)
+    .map(([item_id, val]) => {
+      const qty = cartEntryQty({ [item_id]: val }, item_id)
+      const detail = { item_id, qty }
+      const adj = typeof val === 'object' && val?.ingredientAdjustments
+      if (adj && Object.keys(adj).length) {
+        detail.ingredient_adjustments = Object.entries(adj).map(([stock_item_id, quantity]) => ({
+          stock_item_id,
+          quantity: Number(quantity),
+        }))
+      }
+      return detail
+    })
+    .filter((d) => d.qty > 0)
+}
+
+function orderDetailsToCart(details) {
+  const cart = {}
+  for (const d of details ?? []) {
+    const entry = { qty: d.qty }
+    if (d.ingredient_adjustments?.length) {
+      entry.ingredientAdjustments = Object.fromEntries(
+        d.ingredient_adjustments.map((a) => [a.stock_item_id, a.quantity]),
+      )
+    }
+    cart[d.item_id] = entry
+  }
+  return cart
+}
+
+function ingredientStep(baseQty) {
+  const n = Number(baseQty)
+  if (n >= 10) return 1
+  if (n >= 1) return 0.1
+  return 0.01
+}
+
+function fmtIngredientQty(n) {
+  const v = Number(n)
+  if (Number.isNaN(v)) return '0'
+  return Number(v.toFixed(3)).toString()
+}
+
+/** Cap cart qty to max_orderable_qty from API (AND + OR substitute groups). */
 function clampCartToMaxStock(cart, items) {
   if (!items?.length) return cart
   let changed = false
@@ -62,10 +128,11 @@ function clampCartToMaxStock(cart, items) {
     if (!row) continue
     if (row.max_orderable_qty == null || row.max_orderable_qty === undefined) continue
     const cap = Math.max(0, Number(row.max_orderable_qty))
-    if (next[id] > cap) {
+    const qty = cartEntryQty(next, id)
+    if (qty > cap) {
       changed = true
       if (cap <= 0) delete next[id]
-      else next[id] = cap
+      else next[id] = typeof next[id] === 'number' ? { qty: cap } : { ...next[id], qty: cap }
     }
   }
   return changed ? next : cart
@@ -83,9 +150,11 @@ const fmtDayHeader = (isoDay) =>
   new Date(isoDay + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
 
 const STATUS_TABS = ['pending', 'in_progress', 'delivered', 'completed', 'cancelled']
+const PAYMENT_METHODS = ['transfer', 'cash', 'mixed']
+const DEFAULT_PAYMENT_METHOD = 'transfer'
 
 // ──────────────────────────────────────────────────────────────────────────────
-function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onCancelCompleted, onServeItem, servingItem, t, canEdit, canStart, isSuperadmin, usersMap }) {
+function OrderCard({ order, onAction, onEditItems, onEditDiscount, onEditPayment, onDelete, onCancelCompleted, onServeItem, servingItem, t, canEdit, canStart, isSuperadmin, usersMap }) {
   const [serveDialog, setServeDialog] = useState(null) // { itemId, name, remaining }
   const [serveQty, setServeQty] = useState(1)
 
@@ -164,6 +233,19 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
                 )}
                 <span className={`flex-1 ${done ? 'line-through text-muted' : ''}`}>
                   {d.qty}× {d.name}
+                  {d.ingredient_adjustments?.length > 0 && (
+                    <span className="block text-xs text-amber-700 font-normal mt-0.5">
+                      {d.ingredient_adjustments.map((a) => (
+                        <span key={a.stock_item_id} className="block">
+                          {a.stock_item_name}: {fmtIngredientQty(a.quantity)} {a.stock_item_unit}
+                          {' '}
+                          <span className="text-amber-600/80">
+                            ({t('orders.ingredient_was', { n: fmtIngredientQty(a.recipe_quantity) })})
+                          </span>
+                        </span>
+                      ))}
+                    </span>
+                  )}
                   {servedQty > 0 && !done && (
                     <span className="ml-1.5 text-xs text-amber-600 font-medium">
                       ({t('orders.served_progress', { served: servedQty, total: d.qty })})
@@ -215,6 +297,11 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
             )}
           </div>
           <div className="flex flex-wrap gap-2">
+            {order.status === 'completed' && isSuperadmin && (
+              <Button size="sm" variant="secondary" onClick={() => onEditPayment(order)}>
+                <Banknote size={13} /> {t('orders.edit_payment')}
+              </Button>
+            )}
             {canEditDiscount && (
               <Button size="sm" variant="secondary" onClick={() => onEditDiscount(order)}>
                 <Tag size={13} /> {t('orders.edit_discount')}
@@ -306,9 +393,110 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+function IngredientCustomizePanel({ itemId, itemName, cart, setCart, t }) {
+  const { data: recipe, isLoading } = useQuery({
+    queryKey: ['recipe', itemId],
+    queryFn: () => getRecipe(itemId),
+    enabled: Boolean(itemId),
+  })
+
+  const entry = cart[itemId]
+  const overrides = (typeof entry === 'object' && entry?.ingredientAdjustments) || {}
+
+  const setOverride = (stockItemId, baseQty, delta) => {
+    const step = ingredientStep(baseQty)
+    setCart((c) => {
+      const cur = c[itemId]
+      const qty = cartEntryQty(c, itemId)
+      const prevAdj = typeof cur === 'object' && cur?.ingredientAdjustments ? { ...cur.ingredientAdjustments } : {}
+      const current = prevAdj[stockItemId] ?? baseQty
+      const nextVal = Math.max(0, Math.round((current + delta * step) * 1000) / 1000)
+      const nextAdj = { ...prevAdj }
+      if (Math.abs(nextVal - baseQty) <= 1e-9) delete nextAdj[stockItemId]
+      else nextAdj[stockItemId] = nextVal
+      return {
+        ...c,
+        [itemId]: {
+          qty,
+          ...(Object.keys(nextAdj).length ? { ingredientAdjustments: nextAdj } : {}),
+        },
+      }
+    })
+  }
+
+  if (isLoading) {
+    return <p className="text-xs text-muted px-3 py-2">{t('orders.ingredients_loading')}</p>
+  }
+  if (!recipe?.ingredients?.length) {
+    return <p className="text-xs text-muted px-3 py-2">{t('orders.no_recipe_ingredients')}</p>
+  }
+
+  const orGroups = new Map()
+  const andIngredients = []
+  for (const ing of recipe.ingredients) {
+    if (ing.substitute_group != null) {
+      const g = ing.substitute_group
+      if (!orGroups.has(g)) orGroups.set(g, [])
+      orGroups.get(g).push(ing)
+    } else {
+      andIngredients.push(ing)
+    }
+  }
+
+  return (
+    <div className="mx-3 mb-2 rounded-lg border border-amber-200 bg-amber-50/60 px-3 py-2 space-y-1.5">
+      <p className="text-xs font-medium text-amber-900">{t('orders.customize_ingredients', { name: itemName })}</p>
+      {andIngredients.map((ing) => {
+        const base = Number(ing.quantity)
+        const effective = overrides[ing.stock_item_id] ?? base
+        const changed = Math.abs(effective - base) > 1e-9
+        return (
+          <div key={ing.stock_item_id} className="flex items-center justify-between gap-2 text-xs">
+            <span className={`min-w-0 truncate ${changed ? 'text-amber-900 font-medium' : 'text-slate-600'}`}>
+              {ing.stock_item_name}
+              <span className="text-muted ml-1">({ing.stock_item_unit})</span>
+            </span>
+            <div className="flex items-center gap-1 flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => setOverride(ing.stock_item_id, base, -1)}
+                disabled={effective <= 0}
+                className="h-6 w-6 rounded border border-amber-200 text-slate-600 hover:bg-amber-100 text-sm font-bold disabled:opacity-30"
+              >
+                −
+              </button>
+              <span className="w-14 text-center font-medium tabular-nums">{fmtIngredientQty(effective)}</span>
+              <button
+                type="button"
+                onClick={() => setOverride(ing.stock_item_id, base, 1)}
+                className="h-6 w-6 rounded border border-amber-200 text-slate-600 hover:bg-amber-100 text-sm font-bold"
+              >
+                +
+              </button>
+            </div>
+          </div>
+        )
+      })}
+      {[...orGroups.entries()].map(([groupId, opts]) => (
+        <div key={`or-${groupId}`} className="text-xs text-slate-600 border-l-2 border-amber-300 pl-2">
+          <p className="font-medium text-amber-800">{t('orders.or_substitutes_label')}</p>
+          <p className="text-muted mt-0.5">
+            {opts
+              .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0))
+              .map((o) => o.stock_item_name)
+              .join(` ${t('recipes.or_badge')} `)}
+          </p>
+          <p className="text-muted mt-0.5">{t('orders.or_substitutes_hint')}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function ItemSelector({ categories, items, cart, setCart, t }) {
   const [search, setSearch] = useState('')
   const [activeCat, setActiveCat] = useState(null)
+  const [customizeItemId, setCustomizeItemId] = useState(null)
   const effectiveCat = activeCat ?? categories[0]?.id
 
   const visibleItems = items.filter((i) =>
@@ -325,12 +513,15 @@ function ItemSelector({ categories, items, cart, setCart, t }) {
         row?.max_orderable_qty != null && row?.max_orderable_qty !== undefined
           ? Math.max(0, Number(row.max_orderable_qty))
           : null
-      const cur = c[id] ?? 0
+      const cur = cartEntryQty(c, id)
       if (delta > 0 && cap != null && cur >= cap) return c
       const next = cur + delta
-      if (next <= 0) { const { [id]: _, ...rest } = c; return rest }
-      if (cap != null && next > cap) return { ...c, [id]: cap }
-      return { ...c, [id]: next }
+      if (next <= 0) {
+        if (customizeItemId === id) setCustomizeItemId(null)
+        return setCartEntryQty(c, id, 0)
+      }
+      const capped = cap != null && next > cap ? cap : next
+      return setCartEntryQty(c, id, capped)
     })
 
   return (
@@ -359,54 +550,84 @@ function ItemSelector({ categories, items, cart, setCart, t }) {
         onChange={(e) => setSearch(e.target.value)}
         className="w-full h-9 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500 mb-2"
       />
-      <div className="space-y-1 max-h-48 overflow-y-auto">
+      <div className="space-y-1 max-h-64 overflow-y-auto">
         {visibleItems.map((item) => {
-          const qty = cart[item.id] ?? 0
+          const qty = cartEntryQty(cart, item.id)
+          const entry = cart[item.id]
+          const hasCustom =
+            typeof entry === 'object'
+            && entry?.ingredientAdjustments
+            && Object.keys(entry.ingredientAdjustments).length > 0
           const stockOk = item.ingredients_available !== false
           const cap =
             item.max_orderable_qty != null && item.max_orderable_qty !== undefined
               ? Math.max(0, Number(item.max_orderable_qty))
               : null
           const atCap = cap != null && qty >= cap
+          const expanded = customizeItemId === item.id
           return (
-            <div
-              key={item.id}
-              className={`flex items-center justify-between rounded-lg px-3 py-2 ${
-                stockOk ? 'hover:bg-slate-50' : 'bg-slate-50/80 opacity-75'
-              }`}
-            >
-              <div className="min-w-0 pr-2">
-                <p className={`text-sm ${stockOk ? 'text-slate-700' : 'text-slate-500'}`}>{item.name}</p>
-                <p className="text-xs text-muted">{currency(item.price)}</p>
-                {cap != null && stockOk && (
-                  <p className="text-xs text-slate-500 mt-0.5">{t('orders.max_portions_stock', { n: cap })}</p>
-                )}
-                {!stockOk && (
-                  <p className="text-xs font-medium text-amber-700 mt-0.5">{t('orders.sold_out_ingredients')}</p>
-                )}
+            <div key={item.id}>
+              <div
+                className={`flex items-center justify-between rounded-lg px-3 py-2 ${
+                  stockOk ? 'hover:bg-slate-50' : 'bg-slate-50/80 opacity-75'
+                }`}
+              >
+                <div className="min-w-0 pr-2">
+                  <p className={`text-sm ${stockOk ? 'text-slate-700' : 'text-slate-500'}`}>{item.name}</p>
+                  <p className="text-xs text-muted">{currency(item.price)}</p>
+                  {cap != null && stockOk && (
+                    <p className="text-xs text-slate-500 mt-0.5">{t('orders.max_portions_stock', { n: cap })}</p>
+                  )}
+                  {!stockOk && (
+                    <p className="text-xs font-medium text-amber-700 mt-0.5">{t('orders.sold_out_ingredients')}</p>
+                  )}
+                  {hasCustom && (
+                    <p className="text-xs font-medium text-amber-700 mt-0.5">{t('orders.ingredients_customized')}</p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {qty > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setCustomizeItemId(expanded ? null : item.id)}
+                        className={`text-xs px-2 py-1 rounded-md border transition-colors ${
+                          expanded || hasCustom
+                            ? 'border-amber-300 bg-amber-50 text-amber-800'
+                            : 'border-border text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {t('orders.ingredients_btn')}
+                      </button>
+                      <button type="button" onClick={() => setQty(item.id, -1)}
+                        className="h-7 w-7 rounded-full border border-border text-slate-600 hover:bg-slate-100 text-sm font-bold">−</button>
+                      <span className="w-5 text-center text-sm font-medium">{qty}</span>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setQty(item.id, 1)}
+                    disabled={!stockOk || atCap}
+                    title={
+                      !stockOk
+                        ? t('orders.sold_out_ingredients')
+                        : atCap
+                          ? t('orders.max_portions_stock', { n: cap })
+                          : undefined
+                    }
+                    className="h-7 w-7 rounded-full bg-brand-500 text-white hover:bg-brand-600 text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-500"
+                  >+</button>
+                </div>
               </div>
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {qty > 0 && (
-                  <>
-                    <button type="button" onClick={() => setQty(item.id, -1)}
-                      className="h-7 w-7 rounded-full border border-border text-slate-600 hover:bg-slate-100 text-sm font-bold">−</button>
-                    <span className="w-5 text-center text-sm font-medium">{qty}</span>
-                  </>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setQty(item.id, 1)}
-                  disabled={!stockOk || atCap}
-                  title={
-                    !stockOk
-                      ? t('orders.sold_out_ingredients')
-                      : atCap
-                        ? t('orders.max_portions_stock', { n: cap })
-                        : undefined
-                  }
-                  className="h-7 w-7 rounded-full bg-brand-500 text-white hover:bg-brand-600 text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-500"
-                >+</button>
-              </div>
+              {expanded && qty > 0 && (
+                <IngredientCustomizePanel
+                  itemId={item.id}
+                  itemName={item.name}
+                  cart={cart}
+                  setCart={setCart}
+                  t={t}
+                />
+              )}
             </div>
           )
         })}
@@ -426,10 +647,20 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
   const [discountVal, setDiscountVal] = useState('')
   const [error, setError]     = useState('')
   const [submitBusy, setSubmitBusy] = useState(false)
+  const [paymentMethod, setPaymentMethod] = useState(DEFAULT_PAYMENT_METHOD)
+  const [mixedCash, setMixedCash] = useState('')
 
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: getCategories })
   const { data: items = [] }      = useQuery({ queryKey: ['items', 'available'], queryFn: () => getItems(true) })
   const { data: tables = [] }     = useQuery({ queryKey: ['tables'], queryFn: getTables })
+
+  const isTakeaway = orderFlow === 'takeaway'
+
+  const { data: openShift } = useQuery({
+    queryKey: ['cashier-shift'],
+    queryFn: getCurrentShift,
+    enabled: open && isTakeaway,
+  })
 
   useEffect(() => {
     if (open && defaultOrderFlow) {
@@ -438,13 +669,21 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
   }, [open, defaultOrderFlow])
 
   useEffect(() => {
+    if (!open) {
+      setPaymentMethod(DEFAULT_PAYMENT_METHOD)
+      setMixedCash('')
+    }
+  }, [open])
+
+  useEffect(() => {
     setCart((c) => clampCartToMaxStock(c, items))
   }, [items])
 
   const activeTables = tables.filter((tb) => tb.is_active)
 
-  const cartSubtotal = Object.entries(cart).reduce((s, [id, qty]) => {
+  const cartSubtotal = Object.keys(cart).reduce((s, id) => {
     const item = items.find((i) => i.id === id)
+    const qty = cartEntryQty(cart, id)
     return s + (item ? Number(item.price) * qty : 0)
   }, 0)
   const previewDisc = previewDiscountAmount(
@@ -459,18 +698,24 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['orders'] })
       qc.invalidateQueries({ queryKey: ['items', 'available'] })
+      qc.invalidateQueries({ queryKey: ['cashier-shift'] })
       onClose()
       setCart({}); setTableId(''); setNote(''); setDiscountMode('none'); setDiscountVal(''); setError('')
+      setPaymentMethod(DEFAULT_PAYMENT_METHOD); setMixedCash('')
     },
   })
 
-  const isTakeaway = orderFlow === 'takeaway'
+  const mixedCashNum = mixedCash === '' ? 0 : Number(mixedCash)
+  const mixedTransfer = Math.max(grandTotal - mixedCashNum, 0)
+  const canSubmitTakeaway =
+    !isTakeaway
+    || (openShift && (paymentMethod !== 'mixed' || (mixedCashNum > 0 && mixedCashNum < grandTotal)))
 
   const submit = async (e) => {
     e.preventDefault()
     setError('')
     if (!isTakeaway && !tableId) { setError(t('orders.err_table')); return }
-    const entries = Object.entries(cart)
+    const entries = Object.keys(cart).filter((id) => cartEntryQty(cart, id) > 0)
     if (entries.length === 0) { setError(t('orders.err_items')); return }
     setSubmitBusy(true)
     try {
@@ -481,13 +726,13 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
       const fresh = qc.getQueryData(['items', 'available']) ?? items
       const nextCart = clampCartToMaxStock({ ...cart }, fresh)
       setCart(nextCart)
-      const details = Object.entries(nextCart).map(([item_id, qty]) => ({ item_id, qty }))
+      const details = cartToDetails(nextCart)
       if (details.length === 0) {
         setError(t('orders.err_items'))
         return
       }
-      for (const [id, qty] of Object.entries(nextCart)) {
-        const row = fresh.find((i) => i.id === id)
+      for (const d of details) {
+        const row = fresh.find((i) => i.id === d.item_id)
         if (!row || row.ingredients_available === false) {
           setError(t('orders.sold_out_ingredients'))
           return
@@ -496,14 +741,17 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
           row.max_orderable_qty != null && row.max_orderable_qty !== undefined
             ? Math.max(0, Number(row.max_orderable_qty))
             : null
-        if (cap != null && qty > cap) {
+        if (cap != null && d.qty > cap) {
           setError(t('orders.err_qty_exceeds_stock', { name: row.name, n: cap }))
           return
         }
       }
       const body = isTakeaway
-        ? { order_flow: 'takeaway', note: note || undefined, details }
+        ? { order_flow: 'takeaway', note: note || undefined, details, payment_method: paymentMethod }
         : { order_flow: 'dine_in', table_id: tableId, note: note || undefined, details }
+      if (isTakeaway && paymentMethod === 'mixed') {
+        body.cash_amount = mixedCashNum
+      }
       if (discountMode === 'percent') {
         if (discountVal === '') {
           setError(t('orders.err_discount_pct'))
@@ -644,6 +892,53 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
           onChange={(e) => setNote(e.target.value)}
         />
 
+        {isTakeaway && (
+          <div className="rounded-xl border border-border px-4 py-3 space-y-3">
+            <p className="text-sm font-semibold text-slate-700">{t('tables.payment_method_label')}</p>
+            {!openShift && (
+              <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-800">
+                {t('tables.no_open_shift')}{' '}
+                <Link to="/cashier" className="font-semibold underline">{t('nav.cashier')}</Link>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-3">
+                {PAYMENT_METHODS.map((m) => (
+                  <label key={m} className="flex items-center gap-1.5 text-sm cursor-pointer">
+                    <input
+                      type="radio"
+                      name="takeawayPayment"
+                    value={m}
+                    checked={paymentMethod === m}
+                    onChange={() => { setPaymentMethod(m); setMixedCash('') }}
+                    className="accent-brand-500"
+                  />
+                  {t(`tables.payment_${m}`)}
+                </label>
+              ))}
+            </div>
+            {paymentMethod === 'mixed' && (
+              <div className="space-y-2">
+                <label className="text-sm text-slate-600">{t('tables.mixed_cash_label')}</label>
+                <MoneyInput value={mixedCash} onValueChange={setMixedCash} />
+                {mixedCashNum > 0 && (
+                  <p className="text-sm text-slate-600">
+                    {t('tables.mixed_transfer_part', { amount: currency(mixedTransfer) })}
+                  </p>
+                )}
+                {grandTotal > 0 && mixedCashNum >= grandTotal && (
+                  <p className="text-xs text-red-600">{t('tables.mixed_cash_invalid')}</p>
+                )}
+              </div>
+            )}
+            {paymentMethod === 'cash' && grandTotal > 0 && (
+              <p className="text-sm text-muted">{t('tables.payment_cash_hint', { amount: currency(grandTotal) })}</p>
+            )}
+            {paymentMethod === 'transfer' && grandTotal > 0 && (
+              <p className="text-sm text-muted">{t('tables.payment_transfer_hint', { amount: currency(grandTotal) })}</p>
+            )}
+          </div>
+        )}
+
         {error && (
           <p className="text-sm text-red-600 whitespace-pre-line leading-relaxed">{error}</p>
         )}
@@ -663,8 +958,11 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
           ) : null}
           <div className="flex items-center justify-between gap-2">
             <p className="font-bold text-slate-800">{t('orders.total')} {currency(grandTotal)}</p>
-            <Button type="submit" disabled={submitBusy || (!isTakeaway && activeTables.length === 0)}>
-              {submitBusy ? t('orders.placing') : t('orders.place_order')}
+            <Button
+              type="submit"
+              disabled={submitBusy || (!isTakeaway && activeTables.length === 0) || !canSubmitTakeaway}
+            >
+              {submitBusy ? t('orders.placing') : isTakeaway ? t('orders.place_takeaway_pay') : t('orders.place_order')}
             </Button>
           </div>
         </div>
@@ -838,6 +1136,121 @@ function EditDiscountModal({ open, onClose, order, t }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+function EditPaymentModal({ open, onClose, order, t }) {
+  const qc = useQueryClient()
+  const [paymentMethod, setPaymentMethod] = useState(DEFAULT_PAYMENT_METHOD)
+  const [mixedCash, setMixedCash] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const { data: payment, isLoading } = useQuery({
+    queryKey: ['order-payment', order?.id],
+    queryFn: () => getOrderPayment(order.id),
+    enabled: open && !!order?.id,
+  })
+
+  useEffect(() => {
+    if (!payment) return
+    setPaymentMethod(payment.payment_method)
+    setMixedCash(
+      payment.payment_method === 'mixed' ? String(Number(payment.cash_amount)) : '',
+    )
+    setError('')
+  }, [payment?.id, payment?.payment_method, payment?.cash_amount])
+
+  const total = payment ? Number(payment.total_amount) : 0
+  const mixedCashNum = mixedCash === '' ? 0 : Number(mixedCash)
+  const mixedTransfer = Math.max(total - mixedCashNum, 0)
+  const canSave =
+    payment
+    && (paymentMethod !== 'mixed' || (mixedCashNum > 0 && mixedCashNum < total))
+
+  const submit = async (e) => {
+    e.preventDefault()
+    if (!payment || !canSave) return
+    setBusy(true)
+    setError('')
+    try {
+      const body = { payment_method: paymentMethod }
+      if (paymentMethod === 'mixed') body.cash_amount = mixedCashNum
+      await updatePayment(payment.id, body)
+      qc.invalidateQueries({ queryKey: ['cashier-shift'] })
+      qc.invalidateQueries({ queryKey: ['cashier-shifts'] })
+      qc.invalidateQueries({ queryKey: ['order-payment', order.id] })
+      onClose()
+    } catch (err) {
+      setError(apiErr(err, t))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!order) return null
+
+  const title =
+    order.order_flow === 'takeaway'
+      ? t('orders.payment_modal_title')
+      : `${t('orders.payment_modal_title')} — ${t('orders.table', { n: order.table_name ?? '' })}`
+
+  return (
+    <Modal open={open} onClose={onClose} title={title} maxWidth="max-w-md">
+      {isLoading ? (
+        <div className="py-10 flex justify-center"><Spinner /></div>
+      ) : !payment ? (
+        <p className="text-sm text-muted py-6 text-center">{t('orders.payment_not_found')}</p>
+      ) : (
+        <form onSubmit={submit} className="space-y-4">
+          <p className="text-sm text-slate-600">
+            {t('orders.payment_modal_total', { amount: currency(total) })}
+          </p>
+          <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            {t('orders.payment_edit_warn')}
+          </p>
+          <div>
+            <p className="text-sm font-semibold text-slate-700 mb-2">{t('tables.payment_method_label')}</p>
+            <div className="flex flex-wrap gap-3">
+              {PAYMENT_METHODS.map((m) => (
+                <label key={m} className="flex items-center gap-1.5 text-sm cursor-pointer">
+                  <input
+                    type="radio"
+                    name="editPaymentMethod"
+                    value={m}
+                    checked={paymentMethod === m}
+                    onChange={() => { setPaymentMethod(m); setMixedCash('') }}
+                    className="accent-brand-500"
+                  />
+                  {t(`tables.payment_${m}`)}
+                </label>
+              ))}
+            </div>
+          </div>
+          {paymentMethod === 'mixed' && (
+            <div className="space-y-2">
+              <label className="text-sm text-slate-600">{t('tables.mixed_cash_label')}</label>
+              <MoneyInput value={mixedCash} onValueChange={setMixedCash} />
+              {mixedCashNum > 0 && (
+                <p className="text-sm text-slate-600">
+                  {t('tables.mixed_transfer_part', { amount: currency(mixedTransfer) })}
+                </p>
+              )}
+            </div>
+          )}
+          {error && <p className="text-sm text-red-600">{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>
+              {t('common.cancel')}
+            </Button>
+            <Button type="submit" disabled={busy || !canSave}>
+              {busy ? t('common.saving') : t('common.save')}
+            </Button>
+          </div>
+        </form>
+      )}
+    </Modal>
+  )
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 function EditItemsModal({ open, onClose, order, t }) {
   const qc = useQueryClient()
   const [error, setError] = useState('')
@@ -853,12 +1266,13 @@ function EditItemsModal({ open, onClose, order, t }) {
       setCart({})
       return
     }
-    const raw = Object.fromEntries(order.details.map((d) => [d.item_id, d.qty]))
+    const raw = orderDetailsToCart(order.details)
     setCart(clampCartToMaxStock(raw, items))
   }, [order?.id, items])
 
-  const total = Object.entries(cart).reduce((s, [id, qty]) => {
+  const total = Object.keys(cart).reduce((s, id) => {
     const item = items.find((i) => i.id === id)
+    const qty = cartEntryQty(cart, id)
     return s + (item ? Number(item.price) * qty : 0)
   }, 0)
 
@@ -875,7 +1289,7 @@ function EditItemsModal({ open, onClose, order, t }) {
   const submit = async (e) => {
     e.preventDefault()
     setError('')
-    const entries = Object.entries(cart)
+    const entries = Object.keys(cart).filter((id) => cartEntryQty(cart, id) > 0)
     if (entries.length === 0) { setError(t('orders.err_items')); return }
     setSubmitBusy(true)
     try {
@@ -886,13 +1300,13 @@ function EditItemsModal({ open, onClose, order, t }) {
       const fresh = qc.getQueryData(['items', 'available']) ?? items
       const nextCart = clampCartToMaxStock({ ...cart }, fresh)
       setCart(nextCart)
-      const details = Object.entries(nextCart).map(([item_id, qty]) => ({ item_id, qty }))
+      const details = cartToDetails(nextCart)
       if (details.length === 0) {
         setError(t('orders.err_items'))
         return
       }
-      for (const [id, qty] of Object.entries(nextCart)) {
-        const row = fresh.find((i) => i.id === id)
+      for (const d of details) {
+        const row = fresh.find((i) => i.id === d.item_id)
         if (!row || row.ingredients_available === false) {
           setError(t('orders.sold_out_ingredients'))
           return
@@ -901,7 +1315,7 @@ function EditItemsModal({ open, onClose, order, t }) {
           row.max_orderable_qty != null && row.max_orderable_qty !== undefined
             ? Math.max(0, Number(row.max_orderable_qty))
             : null
-        if (cap != null && qty > cap) {
+        if (cap != null && d.qty > cap) {
           setError(t('orders.err_qty_exceeds_stock', { name: row.name, n: cap }))
           return
         }
@@ -1014,6 +1428,7 @@ export default function Orders() {
   const [newOrderOpen, setNewOrderOpen] = useState(false)
   const [editOrder, setEditOrder]   = useState(null)
   const [editDiscountOrder, setEditDiscountOrder] = useState(null)
+  const [editPaymentOrder, setEditPaymentOrder] = useState(null)
   const [confirmDelOrder, setConfirmDelOrder] = useState(null)
   const [cancelCompletedOrder, setCancelCompletedOrder] = useState(null)
   const [cancelCompletedRestoreStock, setCancelCompletedRestoreStock] = useState(true)
@@ -1214,6 +1629,7 @@ export default function Orders() {
                     onAction={(id, status) => mutation.mutate({ id, status })}
                     onEditItems={(o) => setEditOrder(o)}
                     onEditDiscount={(o) => setEditDiscountOrder(o)}
+                    onEditPayment={(o) => setEditPaymentOrder(o)}
                     onDelete={(id) => setConfirmDelOrder(id)}
                     onCancelCompleted={(o) => { setMutErr(''); setCancelCompletedRestoreStock(true); setCancelCompletedOrder(o) }}
                     onServeItem={(orderId, itemId, qty) => serveMut.mutate({ orderId, itemId, qty })}
@@ -1238,6 +1654,7 @@ export default function Orders() {
               onAction={(id, status) => mutation.mutate({ id, status })}
               onEditItems={(o) => setEditOrder(o)}
               onEditDiscount={(o) => setEditDiscountOrder(o)}
+              onEditPayment={(o) => setEditPaymentOrder(o)}
               onDelete={(id) => setConfirmDelOrder(id)}
               onCancelCompleted={(o) => { setMutErr(''); setCancelCompletedRestoreStock(true); setCancelCompletedOrder(o) }}
               onServeItem={(orderId, itemId, qty) => serveMut.mutate({ orderId, itemId, qty })}
@@ -1258,6 +1675,12 @@ export default function Orders() {
         open={!!editDiscountOrder}
         onClose={() => setEditDiscountOrder(null)}
         order={editDiscountOrder}
+        t={t}
+      />
+      <EditPaymentModal
+        open={!!editPaymentOrder}
+        onClose={() => setEditPaymentOrder(null)}
+        order={editPaymentOrder}
         t={t}
       />
 

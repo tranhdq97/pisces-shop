@@ -61,7 +61,7 @@ class DashboardSummary(BaseModel):
     inventory_cost: Decimal
     # --- KPIs ---
     cancellation_rate: float        # cancelled / total * 100
-    food_cost_ratio: float          # inventory_cost / revenue * 100
+    food_cost_ratio: float          # procurement inventory_cost / revenue * 100
     avg_items_per_order: float      # avg qty items per completed order
     avg_table_session_minutes: float  # avg table occupancy duration (minutes)
     # --- lists ---

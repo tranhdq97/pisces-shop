@@ -4,7 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import {
   LayoutDashboard, UtensilsCrossed, ClipboardList,
   CheckSquare, Users, ShieldCheck, X, Globe, Armchair, Package,
-  Banknote, ChefHat, TrendingUp, MonitorCheck, Truck, Images,
+  Banknote, ChefHat, TrendingUp, MonitorCheck, Truck, Images, Wallet,
 } from 'lucide-react'
 import { useAuth } from '../hooks/useAuth'
 import { useT, LANG_OPTIONS } from '../i18n'
@@ -17,6 +17,7 @@ const NAV_ITEMS = [
   { to: '/orders',     labelKey: 'nav.orders',      icon: ClipboardList,   permission: 'orders.view'    },
   { to: '/kitchen',    labelKey: 'nav.kitchen',     icon: MonitorCheck,    permission: 'orders.start'   },
   { to: '/tables',     labelKey: 'nav.tables',      icon: Armchair,        permission: 'tables.view'    },
+  { to: '/cashier',    labelKey: 'nav.cashier',     icon: Wallet,          permission: 'cashier.view'   },
   { to: '/inventory',  labelKey: 'nav.inventory',   icon: Package,         permission: 'inventory.view' },
   { to: '/suppliers',  labelKey: 'nav.suppliers',   icon: Truck,           permission: 'inventory.view' },
   { to: '/recipes',    labelKey: 'nav.recipes',     icon: ChefHat,         permission: 'recipe.view'    },

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import uuid
 
+from collections import defaultdict
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -28,6 +30,8 @@ def _to_read(r: RecipeItem) -> RecipeItemRead:
         stock_item_unit=r.stock_item.unit,
         quantity=float(r.quantity),
         notes=r.notes,
+        substitute_group=r.substitute_group,
+        priority=int(r.priority),
     )
 
 
@@ -91,6 +95,8 @@ class RecipeService:
                 stock_item_id=ing.stock_item_id,
                 quantity=ing.quantity,
                 notes=ing.notes,
+                substitute_group=ing.substitute_group,
+                priority=ing.priority,
             ))
 
         # Replace steps
@@ -172,16 +178,14 @@ class RecipeService:
         recipe_items = ing_result.scalars().all()
 
         cost_lines: list[IngredientCostLine] = []
-        all_priced = True
 
         for ri in recipe_items:
-            # Get most recent stock entry with a unit price
             price_result = await self._db.execute(
                 select(StockEntry.unit_price)
                 .where(
                     StockEntry.stock_item_id == ri.stock_item_id,
                     StockEntry.unit_price.is_not(None),
-                    StockEntry.quantity > 0,  # intake entries only
+                    StockEntry.quantity > 0,
                 )
                 .order_by(StockEntry.created_at.desc())
                 .limit(1)
@@ -190,8 +194,6 @@ class RecipeService:
             last_unit_price = float(last_price_row) if last_price_row is not None else None
             recipe_qty = float(ri.quantity)
             line_cost = round(last_unit_price * recipe_qty, 4) if last_unit_price is not None else None
-            if line_cost is None:
-                all_priced = False
 
             cost_lines.append(IngredientCostLine(
                 stock_item_id=ri.stock_item_id,
@@ -200,12 +202,24 @@ class RecipeService:
                 recipe_quantity=recipe_qty,
                 last_unit_price=last_unit_price,
                 line_cost=line_cost,
+                substitute_group=ri.substitute_group,
+                priority=int(ri.priority),
+                is_substitute=ri.substitute_group is not None,
             ))
+
+        or_groups: dict[int, list[IngredientCostLine]] = defaultdict(list)
+        for cl in cost_lines:
+            if cl.substitute_group is not None:
+                or_groups[cl.substitute_group].append(cl)
+
+        cost_basis = [cl for cl in cost_lines if cl.substitute_group is None]
+        for opts in or_groups.values():
+            cost_basis.append(min(opts, key=lambda x: x.priority))
 
         total_cost: float | None = None
         margin_pct: float | None = None
-        if all_priced and cost_lines:
-            total_cost = round(sum(cl.line_cost for cl in cost_lines), 2)  # type: ignore[arg-type]
+        if cost_basis and all(cl.line_cost is not None for cl in cost_basis):
+            total_cost = round(sum(cl.line_cost for cl in cost_basis), 2)  # type: ignore[arg-type]
             if selling_price > 0:
                 margin_pct = round((selling_price - total_cost) / selling_price * 100, 2)
 

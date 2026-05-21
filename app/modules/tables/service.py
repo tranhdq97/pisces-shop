@@ -90,8 +90,17 @@ class TableService:
         await self._db.refresh(table)
         return table
 
-    async def pay_table(self, table_id: uuid.UUID) -> Table:
-        """Mark all active orders as COMPLETED (paid) and set table to needs_clearing."""
+    async def pay_table(
+        self,
+        table_id: uuid.UUID,
+        *,
+        payment_method: str,
+        cash_amount=None,
+        discount_type: str | None = None,
+        discount_value=None,
+    ):
+        """Mark billable orders paid, record payment on open shift, set table to needs_clearing."""
+        from app.modules.cashier.service import CashierService
         from app.modules.orders.models import Order, OrderStatus
 
         table = await self.get_table(table_id)
@@ -110,13 +119,32 @@ class TableService:
         if not orders:
             raise AppException(status_code=409, detail="No billable orders for this table.", code="no_billable_orders")
 
+        cashier = CashierService(self._db)
+        shift = await cashier.require_open_shift()
+
+        # Map UI discount type `pct` → stored `percent`
+        bill_discount_type = discount_type
+        if bill_discount_type == "pct":
+            bill_discount_type = "percent"
+
+        payment = await cashier.record_table_payment(
+            shift=shift,
+            table_id=table_id,
+            table_name=table.name,
+            orders=orders,
+            payment_method=payment_method,
+            cash_amount=cash_amount,
+            discount_type=bill_discount_type,
+            discount_value=discount_value,
+        )
+
         for order in orders:
             order.status = OrderStatus.COMPLETED
 
         table.needs_clearing = True
         await self._db.flush()
         await self._db.refresh(table)
-        return table
+        return table, payment
 
     async def clear_table(self, table_id: uuid.UUID) -> Table:
         table = await self.get_table(table_id)

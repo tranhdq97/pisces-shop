@@ -10,6 +10,7 @@ import Dashboard from './pages/Dashboard'
 import Menu from './pages/Menu'
 import Orders from './pages/Orders'
 import Tables from './pages/Tables'
+import Cashier from './pages/Cashier'
 import Inventory from './pages/Inventory'
 import Suppliers from './pages/Suppliers'
 import Kitchen from './pages/Kitchen'
@@ -114,6 +115,12 @@ export default function App() {
               <Route path="/tables" element={
                 <ProtectedRoute permission="tables.view">
                   <Tables />
+                </ProtectedRoute>
+              } />
+
+              <Route path="/cashier" element={
+                <ProtectedRoute permission="cashier.view">
+                  <Cashier />
                 </ProtectedRoute>
               } />
 

@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppException
 from app.modules.financials.models import CostTemplate, MonthlyCostEntry
+from app.modules.inventory.reporting import procurement_entry_filter
 from app.modules.financials.schemas import (
     CostTemplateCreate,
     CostTemplateRead,
@@ -114,7 +115,8 @@ class FinancialsService:
                 MonthlyCostEntry.period_year == year,
                 MonthlyCostEntry.period_month == month,
             )
-            .order_by(MonthlyCostEntry.created_at)
+            # Newest first so recent expenses are visible on top.
+            .order_by(MonthlyCostEntry.created_at.desc())
         )
         return [_entry_to_read(e) for e in result.scalars().all()]
 
@@ -183,7 +185,7 @@ class FinancialsService:
         inv_total_result = await self._db.execute(
             select(func.sum(StockEntry.total_cost)).where(
                 StockEntry.total_cost.isnot(None),
-                StockEntry.quantity > 0,
+                procurement_entry_filter(),
                 func.date(StockEntry.created_at) >= date_from,
                 func.date(StockEntry.created_at) <= date_to,
             )
@@ -196,7 +198,7 @@ class FinancialsService:
                 func.sum(StockEntry.total_cost).label("total"),
             ).where(
                 StockEntry.total_cost.isnot(None),
-                StockEntry.quantity > 0,
+                procurement_entry_filter(),
                 func.date(StockEntry.created_at) >= date_from,
                 func.date(StockEntry.created_at) <= date_to,
             ).group_by(func.extract("day", StockEntry.created_at))
@@ -294,7 +296,7 @@ class FinancialsService:
                 func.sum(StockEntry.total_cost).label("total"),
             ).where(
                 StockEntry.total_cost.isnot(None),
-                StockEntry.quantity > 0,
+                procurement_entry_filter(),
                 func.date(StockEntry.created_at) >= date_from,
                 func.date(StockEntry.created_at) <= date_to,
             ).group_by(func.extract("month", StockEntry.created_at))

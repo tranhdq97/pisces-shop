@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { clearToken, getToken } from './authToken'
 
 export const SESSION_EXPIRED_EVENT = 'pisces:session-expired'
 
@@ -26,7 +27,7 @@ function isPublicSpaPath() {
 
 // Attach JWT on every request
 client.interceptors.request.use((config) => {
-  const token = localStorage.getItem('token')
+  const token = getToken()
   if (token) config.headers.Authorization = `Bearer ${token}`
   const lang = typeof localStorage !== 'undefined' ? localStorage.getItem('lang') || 'vi' : 'vi'
   config.headers['Accept-Language'] = lang === 'en' ? 'en' : 'vi'
@@ -58,7 +59,7 @@ client.interceptors.response.use(
   (res) => res,
   (err) => {
     if (err.response?.status === 401 && !skipLoginRedirectOn401(err.config)) {
-      localStorage.removeItem('token')
+      clearToken()
       window.dispatchEvent(new CustomEvent(SESSION_EXPIRED_EVENT))
       if (!isPublicSpaPath()) {
         window.location.href = '/login'

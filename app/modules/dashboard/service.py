@@ -19,6 +19,7 @@ from app.modules.dashboard.schemas import (
     TopItemsByCategory,
 )
 from app.modules.inventory.models import StockEntry
+from app.modules.inventory.reporting import procurement_entry_filter
 from app.modules.menu.models import Category, MenuItem
 from app.modules.orders.models import Order, OrderStatus
 from app.modules.orders.totals import order_total
@@ -31,18 +32,28 @@ class DashboardService:
         self._db = db
 
     async def get_summary(self, date_from: date, date_to: date) -> DashboardSummary:
-        # ── Fetch all orders in range ─────────────────────────────────────────
-        result = await self._db.execute(
+        # ── Orders created in range (volume / pipeline) ───────────────────────
+        created_result = await self._db.execute(
             select(Order).where(
                 func.date(Order.created_at) >= date_from,
                 func.date(Order.created_at) <= date_to,
             )
         )
-        orders = list(result.scalars().all())
+        orders_created = list(created_result.scalars().all())
 
-        total_orders = len(orders)
-        completed = [o for o in orders if o.status == OrderStatus.COMPLETED]
-        cancelled = [o for o in orders if o.status == OrderStatus.CANCELLED]
+        # ── Orders completed/paid in range (revenue & sales analytics) ────────
+        completed_result = await self._db.execute(
+            select(Order).where(
+                Order.status == OrderStatus.COMPLETED,
+                func.date(Order.updated_at) >= date_from,
+                func.date(Order.updated_at) <= date_to,
+            )
+        )
+        orders_completed = list(completed_result.scalars().all())
+
+        total_orders = len(orders_created)
+        cancelled = [o for o in orders_created if o.status == OrderStatus.CANCELLED]
+        completed = orders_completed
 
         total_revenue = Decimal("0")
         item_totals: dict[str, dict] = defaultdict(lambda: {"name": "", "qty": 0, "revenue": Decimal("0")})
@@ -60,8 +71,8 @@ class DashboardService:
         staff_orders_all: dict[str, int] = defaultdict(int)
         staff_revenue: dict[str, Decimal] = defaultdict(Decimal)
 
-        # Track orders per staff across all statuses
-        for order in orders:
+        # Track orders taken per staff (created in range, any status)
+        for order in orders_created:
             if order.created_by_id:
                 staff_orders_all[str(order.created_by_id)] += 1
 
@@ -177,18 +188,18 @@ class DashboardService:
             for h, c in sorted(hour_counts.items())
         ]
 
-        # ── Inventory cost ────────────────────────────────────────────────────
+        # ── Inventory cost (manual warehouse intake/adjustments only) ─────────
         inv_result = await self._db.execute(
             select(func.sum(StockEntry.total_cost)).where(
                 StockEntry.total_cost.isnot(None),
+                procurement_entry_filter(),
                 func.date(StockEntry.created_at) >= date_from,
                 func.date(StockEntry.created_at) <= date_to,
-                StockEntry.quantity > 0,
             )
         )
         inventory_cost = Decimal(str(inv_result.scalar() or 0))
 
-        food_cost_ratio = (
+        intake_cost_ratio = (
             float(inventory_cost) / float(total_revenue) * 100
             if total_revenue > 0
             else 0.0
@@ -339,7 +350,7 @@ class DashboardService:
             average_order_value=avg.quantize(Decimal("0.01")),
             inventory_cost=inventory_cost.quantize(Decimal("0.01")),
             cancellation_rate=round(cancellation_rate, 1),
-            food_cost_ratio=round(food_cost_ratio, 1),
+            food_cost_ratio=round(intake_cost_ratio, 1),
             avg_items_per_order=round(avg_items_per_order, 1),
             avg_table_session_minutes=round(avg_table_session_minutes, 1),
             top_items=top_items,

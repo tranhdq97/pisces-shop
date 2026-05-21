@@ -7,8 +7,10 @@ import Button from '../components/Button'
 import Input from '../components/Input'
 import MoneyInput from '../components/MoneyInput'
 import Spinner from '../components/Spinner'
+import { Link } from 'react-router-dom'
 import { getTables, createTable, updateTable, deleteTable, clearTable, payTable } from '../api/tables'
 import { getOrders } from '../api/orders'
+import { getCurrentShift } from '../api/cashier'
 import { useT } from '../i18n'
 import { useAuth } from '../hooks/useAuth'
 import { apiErr } from '../api/apiErr'
@@ -95,11 +97,14 @@ export default function Tables() {
   const [editTable, setEditTable]   = useState(null)
   const [confirmDel, setConfirmDel] = useState(null)
   const [billTable, setBillTable]   = useState(null)
+  const [billViewOnly, setBillViewOnly] = useState(false)
   const [mutErr, setMutErr]         = useState('')
   const [discountType, setDiscountType]   = useState('fixed')   // 'fixed' | 'pct'
   const [discountFixed, setDiscountFixed] = useState('')       // number | '' (VND)
   const [discountPct, setDiscountPct]     = useState('')
   const [splitCount, setSplitCount]       = useState('')
+  const [paymentMethod, setPaymentMethod] = useState('transfer')
+  const [mixedCash, setMixedCash]         = useState('')
 
   const emptyForm = { name: '', sort_order: 0, is_active: true }
   const [form, setForm] = useState(emptyForm)
@@ -118,7 +123,16 @@ export default function Tables() {
     select: (d) => d.items.filter((o) => !['cancelled', 'completed'].includes(o.status)),
   })
   const billOrders = billOrdersData ?? []
-  const billTotal  = billOrders.flatMap((o) => o.details).reduce((s, i) => s + Number(i.subtotal), 0)
+  const billSubtotal = billOrders.reduce((s, o) => s + Number(o.total ?? 0), 0)
+
+  const { data: openShift, isLoading: shiftLoading } = useQuery({
+    queryKey: ['cashier-shift'],
+    queryFn: getCurrentShift,
+    enabled: canPay,
+    refetchInterval: 15_000,
+  })
+  const shiftOpen = !!openShift
+  const canAcceptPayment = shiftOpen
 
   const setField = (k) => (e) =>
     setForm((f) => ({ ...f, [k]: e.target.type === 'checkbox' ? e.target.checked : e.target.value }))
@@ -143,8 +157,12 @@ export default function Tables() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['tables'] }),
   })
   const payMut = useMutation({
-    mutationFn: (id) => payTable(id),
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['tables'] }); setBillTable(null) },
+    mutationFn: ({ id, data }) => payTable(id, data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['tables'] })
+      qc.invalidateQueries({ queryKey: ['cashier-shift'] })
+      closeBill()
+    },
     onError: (e) => setMutErr(apiErr(e, t)),
   })
   const clearMut = useMutation({
@@ -157,13 +175,48 @@ export default function Tables() {
   const discountVal = (() => {
     if (discountType === 'fixed') {
       const amt = discountFixed === '' ? 0 : Number(discountFixed)
-      return Math.min(amt, billTotal)
+      return Math.min(amt, billSubtotal)
     }
     const amt = parseFloat(discountPct) || 0
-    return Math.min(billTotal * amt / 100, billTotal)
+    return Math.min(billSubtotal * amt / 100, billSubtotal)
   })()
-  const finalTotal = Math.max(billTotal - discountVal, 0)
+  const finalTotal = Math.max(billSubtotal - discountVal, 0)
   const splitN     = parseInt(splitCount, 10) || 0
+  const mixedCashNum = mixedCash === '' ? 0 : Number(mixedCash)
+  const mixedTransfer = Math.max(finalTotal - mixedCashNum, 0)
+
+  const buildPayPayload = () => {
+    const payload = { payment_method: paymentMethod }
+    if (paymentMethod === 'mixed') {
+      payload.cash_amount = mixedCashNum
+    }
+    if (discountVal > 0) {
+      payload.discount_type = discountType === 'pct' ? 'pct' : 'fixed'
+      payload.discount_value = discountType === 'pct' ? parseFloat(discountPct) || 0 : discountVal
+    }
+    return payload
+  }
+
+  const canConfirmPay = canAcceptPayment && (
+    paymentMethod !== 'mixed'
+    || (mixedCashNum > 0 && mixedCashNum < finalTotal)
+  )
+
+  const openBill = (tbl, viewOnly) => {
+    setDiscountType('fixed')
+    setDiscountFixed('')
+    setDiscountPct('')
+    setSplitCount('')
+    setPaymentMethod('transfer')
+    setMixedCash('')
+    setBillViewOnly(viewOnly)
+    setBillTable(tbl)
+  }
+
+  const closeBill = () => {
+    setBillTable(null)
+    setBillViewOnly(false)
+  }
 
   return (
     <Layout title={t('nav.tables')}>
@@ -171,6 +224,13 @@ export default function Tables() {
         <div className="mb-4 rounded-lg bg-red-50 border border-red-200 px-4 py-2 text-sm text-red-600 flex justify-between">
           <span>{mutErr}</span>
           <button onClick={() => setMutErr('')} className="ml-4 font-bold">×</button>
+        </div>
+      )}
+
+      {canPay && !shiftLoading && !shiftOpen && (
+        <div className="mb-4 rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800">
+          {t('tables.shift_closed_banner')}{' '}
+          <Link to="/cashier" className="font-semibold underline">{t('nav.cashier')}</Link>
         </div>
       )}
 
@@ -239,18 +299,22 @@ export default function Tables() {
                       </span>
                     </div>
                   )}
-                  {canPay && (
+                  {canPay && shiftOpen && (
                     <button
-                      onClick={() => {
-                        setDiscountType('fixed')
-                        setDiscountFixed('')
-                        setDiscountPct('')
-                        setSplitCount('')
-                        setBillTable(tbl)
-                      }}
+                      type="button"
+                      onClick={() => openBill(tbl, false)}
                       className="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg bg-amber-500 text-white hover:bg-amber-600 transition-colors"
                     >
                       <Receipt size={13} /> {t('tables.pay_btn')}
+                    </button>
+                  )}
+                  {canPay && !shiftOpen && !shiftLoading && (
+                    <button
+                      type="button"
+                      onClick={() => openBill(tbl, true)}
+                      className="flex items-center gap-1.5 text-xs font-semibold px-3 py-1.5 rounded-lg bg-white border border-amber-300 text-amber-800 hover:bg-amber-50 transition-colors"
+                    >
+                      <Receipt size={13} /> {t('tables.bill_preview_btn')}
                     </button>
                   )}
                 </>
@@ -288,8 +352,12 @@ export default function Tables() {
       {/* ── Bill Modal ──────────────────────────────────────────────────── */}
       <Modal
         open={!!billTable}
-        onClose={() => setBillTable(null)}
-        title={t('tables.bill_title', { name: billTable?.name ?? '' })}
+        onClose={closeBill}
+        title={
+          billViewOnly || !canAcceptPayment
+            ? t('tables.bill_preview_title', { name: billTable?.name ?? '' })
+            : t('tables.bill_title', { name: billTable?.name ?? '' })
+        }
       >
         {billLoading ? (
           <div className="py-8 flex justify-center"><Spinner /></div>
@@ -320,8 +388,18 @@ export default function Tables() {
             {/* Total */}
             <div className="flex justify-between items-center rounded-xl bg-slate-50 border border-border px-4 py-3">
               <span className="font-semibold text-slate-700">{t('tables.bill_total')}</span>
-              <span className="text-xl font-bold text-slate-900">{currency(billTotal)}</span>
+              <span className="text-xl font-bold text-slate-900">{currency(billSubtotal)}</span>
             </div>
+
+            {(!canAcceptPayment || billViewOnly) && (
+              <div className="rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800 space-y-1">
+                <p className="font-semibold">{t('tables.payment_blocked_title')}</p>
+                <p>{t('tables.payment_blocked_body')}</p>
+                <p>
+                  <Link to="/cashier" className="font-semibold underline">{t('nav.cashier')}</Link>
+                </p>
+              </div>
+            )}
 
             {/* Discount section */}
             <div className="rounded-xl border border-border px-4 py-3 space-y-2">
@@ -366,6 +444,47 @@ export default function Tables() {
               )}
             </div>
 
+            {canAcceptPayment && !billViewOnly && (
+              <div className="rounded-xl border border-border px-4 py-3 space-y-3">
+                <p className="text-sm font-semibold text-slate-700">{t('tables.payment_method_label')}</p>
+                <div className="flex flex-wrap gap-3">
+                  {['transfer', 'cash', 'mixed'].map((m) => (
+                    <label key={m} className="flex items-center gap-1.5 text-sm cursor-pointer">
+                      <input
+                        type="radio"
+                        name="paymentMethod"
+                        value={m}
+                        checked={paymentMethod === m}
+                        onChange={() => { setPaymentMethod(m); setMixedCash('') }}
+                        className="accent-brand-500"
+                      />
+                      {t(`tables.payment_${m}`)}
+                    </label>
+                  ))}
+                </div>
+                {paymentMethod === 'mixed' && (
+                  <div className="space-y-2">
+                    <label className="text-sm text-slate-600">{t('tables.mixed_cash_label')}</label>
+                    <MoneyInput value={mixedCash} onValueChange={setMixedCash} />
+                    {mixedCashNum > 0 && (
+                      <p className="text-sm text-slate-600">
+                        {t('tables.mixed_transfer_part', { amount: currency(mixedTransfer) })}
+                      </p>
+                    )}
+                    {mixedCashNum >= finalTotal && finalTotal > 0 && (
+                      <p className="text-xs text-red-600">{t('tables.mixed_cash_invalid')}</p>
+                    )}
+                  </div>
+                )}
+                {paymentMethod === 'cash' && finalTotal > 0 && (
+                  <p className="text-sm text-muted">{t('tables.payment_cash_hint', { amount: currency(finalTotal) })}</p>
+                )}
+                {paymentMethod === 'transfer' && finalTotal > 0 && (
+                  <p className="text-sm text-muted">{t('tables.payment_transfer_hint', { amount: currency(finalTotal) })}</p>
+                )}
+              </div>
+            )}
+
             {/* Split bill section */}
             <div className="rounded-xl border border-border px-4 py-3 space-y-2">
               <p className="text-sm font-semibold text-slate-700">{t('tables.split_btn')}</p>
@@ -388,19 +507,24 @@ export default function Tables() {
             {/* Actions */}
             <div className="flex gap-3 pt-1">
               <button
+                type="button"
                 onClick={() => printBill(billTable, billOrders, discountVal, finalTotal)}
-                className="flex-1 flex items-center justify-center gap-2 rounded-lg border border-border px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors"
+                className={`flex items-center justify-center gap-2 rounded-lg border border-border px-4 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-50 transition-colors ${
+                  canAcceptPayment && !billViewOnly ? 'flex-1' : 'w-full'
+                }`}
               >
                 <Printer size={16} /> {t('tables.bill_print')}
               </button>
-              <Button
-                className="flex-1"
-                onClick={() => payMut.mutate(billTable.id)}
-                disabled={payMut.isPending}
-              >
-                <CheckCircle size={16} />
-                {payMut.isPending ? t('tables.paying') : t('tables.bill_confirm_pay')}
-              </Button>
+              {canAcceptPayment && !billViewOnly && (
+                <Button
+                  className="flex-1"
+                  onClick={() => payMut.mutate({ id: billTable.id, data: buildPayPayload() })}
+                  disabled={payMut.isPending || !canConfirmPay}
+                >
+                  <CheckCircle size={16} />
+                  {payMut.isPending ? t('tables.paying') : t('tables.bill_confirm_pay')}
+                </Button>
+              )}
             </div>
           </div>
         )}

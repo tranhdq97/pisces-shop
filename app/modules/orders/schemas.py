@@ -6,6 +6,7 @@ from typing import Self
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.modules.cashier.models import PaymentMethod
 from app.modules.orders.models import OrderFlow, OrderStatus
 from app.modules.orders.totals import order_discount_amount, order_subtotal_from_details
 
@@ -15,9 +16,24 @@ class OrderDiscountType(StrEnum):
     FIXED = "fixed"
 
 
+class OrderIngredientAdjustment(BaseModel):
+    """Effective quantity per portion for one recipe ingredient (0 = omit)."""
+    stock_item_id: uuid.UUID
+    quantity: float = Field(..., ge=0)
+
+
+class OrderIngredientAdjustmentRead(BaseModel):
+    stock_item_id: uuid.UUID
+    stock_item_name: str
+    stock_item_unit: str
+    recipe_quantity: float
+    quantity: float
+
+
 class OrderItemSchema(BaseModel):
     item_id: uuid.UUID
     qty: int = Field(..., ge=1)
+    ingredient_adjustments: list[OrderIngredientAdjustment] | None = None
 
 
 class OrderItemReadSchema(BaseModel):
@@ -30,6 +46,7 @@ class OrderItemReadSchema(BaseModel):
     served_by: str | None = None
     prep_complexity: str | None = None
     prep_minutes: int | None = None
+    ingredient_adjustments: list[OrderIngredientAdjustmentRead] | None = None
 
     model_config = {"from_attributes": True}
 
@@ -44,6 +61,9 @@ class OrderCreate(BaseModel):
     # Optional order-level discount: percent (0–100) or fixed amount (capped at subtotal when applied).
     discount_type: OrderDiscountType | None = None
     discount_value: Decimal | None = Field(default=None, ge=0)
+    # Required for takeaway — recorded on the open cashier shift.
+    payment_method: PaymentMethod | None = None
+    cash_amount: Decimal | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def discount_type_value_pair(self) -> Self:
@@ -52,6 +72,14 @@ class OrderCreate(BaseModel):
         if self.discount_type == OrderDiscountType.PERCENT and self.discount_value is not None:
             if self.discount_value > 100:
                 raise ValueError("Percent discount cannot exceed 100.")
+        if self.order_flow == OrderFlow.TAKEAWAY and self.payment_method is None:
+            raise ValueError("payment_method is required for takeaway orders.")
+        if self.payment_method == PaymentMethod.CASH and self.cash_amount is not None:
+            raise ValueError("cash_amount must be omitted for cash-only payment.")
+        if self.payment_method == PaymentMethod.TRANSFER and self.cash_amount is not None:
+            raise ValueError("cash_amount must be omitted for transfer-only payment.")
+        if self.payment_method == PaymentMethod.MIXED and self.cash_amount is None:
+            raise ValueError("cash_amount is required for mixed payment.")
         return self
 
 

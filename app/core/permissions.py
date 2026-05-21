@@ -17,6 +17,8 @@ class Permission(StrEnum):
     TABLES_EDIT     = "tables.edit"
     TABLES_CLEAR    = "tables.clear"   # waiter: mark table as cleared after cleaning
     TABLES_PAY      = "tables.pay"     # cashier/waiter: process payment + print bill
+    CASHIER_VIEW    = "cashier.view"   # view open shift summary and payments
+    CASHIER_MANAGE  = "cashier.manage" # open/close cashier shift
     INVENTORY_VIEW  = "inventory.view"
     INVENTORY_EDIT  = "inventory.edit"
     RECIPE_VIEW     = "recipe.view"
@@ -43,6 +45,7 @@ DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
         Permission.SOP_VIEW, Permission.SOP_EDIT, Permission.SOP_VIOLATION_REVIEW,
         Permission.TABLES_VIEW, Permission.TABLES_EDIT,
         Permission.TABLES_CLEAR, Permission.TABLES_PAY,
+        Permission.CASHIER_VIEW, Permission.CASHIER_MANAGE,
         Permission.INVENTORY_VIEW, Permission.INVENTORY_EDIT,
         Permission.RECIPE_VIEW, Permission.RECIPE_EDIT,
         Permission.PAYROLL_HOURS_SUBMIT, Permission.PAYROLL_HOURS_APPROVE,
@@ -56,6 +59,7 @@ DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
         Permission.SOP_VIEW, Permission.SOP_EDIT, Permission.SOP_VIOLATION_REVIEW,
         Permission.TABLES_VIEW, Permission.TABLES_EDIT,
         Permission.TABLES_CLEAR, Permission.TABLES_PAY,
+        Permission.CASHIER_VIEW, Permission.CASHIER_MANAGE,
         Permission.INVENTORY_VIEW, Permission.INVENTORY_EDIT,
         Permission.RECIPE_VIEW, Permission.RECIPE_EDIT,
         Permission.PAYROLL_HOURS_SUBMIT, Permission.PAYROLL_HOURS_APPROVE,
@@ -65,6 +69,7 @@ DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
     "waiter": [
         Permission.ORDERS_VIEW, Permission.ORDERS_EDIT,
         Permission.TABLES_VIEW, Permission.TABLES_CLEAR, Permission.TABLES_PAY,
+        Permission.CASHIER_VIEW, Permission.CASHIER_MANAGE,
         Permission.SOP_VIEW,
         Permission.INVENTORY_VIEW,
         Permission.RECIPE_VIEW,

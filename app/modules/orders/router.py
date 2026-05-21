@@ -9,7 +9,6 @@ from app.core.locale import preferred_locale_from_accept_language
 from app.core.exceptions import AppException
 from app.core.permissions import Permission
 from app.core.security import require_approved_user, require_permission, require_roles
-from app.modules.orders.models import OrderStatus
 from app.modules.orders.schemas import (
     OrderCreate,
     OrderFormDefaults,
@@ -21,6 +20,10 @@ from app.modules.orders.schemas import (
     OrderUpdateItems,
     OrderUpdateStatus,
 )
+from app.modules.cashier.router import _payment_to_read
+from app.modules.cashier.schemas import PaymentRead
+from app.modules.cashier.service import CashierService
+from app.modules.orders.models import OrderStatus
 from app.modules.orders.service import OrderService
 from app.modules.orders.shop_settings_service import ShopSettingsService
 
@@ -100,6 +103,26 @@ async def get_order(
     service = OrderService(db)
     order = await service.get_order(order_id)
     return OrderRead.model_validate(order)
+
+
+@router.get(
+    "/{order_id}/payment",
+    response_model=PaymentRead,
+    dependencies=[Depends(require_roles("superadmin"))],
+)
+async def get_order_payment(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> PaymentRead:
+    order = await OrderService(db).get_order(order_id)
+    if order.status != OrderStatus.COMPLETED:
+        raise AppException(
+            status_code=409,
+            detail="Payment is only available for completed (paid) orders.",
+            code="order_not_paid",
+        )
+    payment = await CashierService(db).get_payment_for_order(order_id)
+    return _payment_to_read(payment)
 
 
 @router.patch("/{order_id}/status", response_model=OrderRead)
