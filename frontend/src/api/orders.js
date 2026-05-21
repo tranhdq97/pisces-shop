@@ -7,11 +7,23 @@ export const patchOrderFormDefaults = (body) =>
   client.patch('/orders/defaults', body).then((r) => r.data)
 
 export const getOrders = (params = {}) =>
-  client.get('/orders', { params }).then((r) => r.data)
+  client
+    .get('/orders', {
+      params,
+      paramsSerializer: { indexes: null },
+    })
+    .then((r) => r.data)
 
 export const getOrder = (id) => client.get(`/orders/${id}`).then((r) => r.data)
 
+export const getOrderPayment = (orderId) =>
+  client.get(`/orders/${orderId}/payment`).then((r) => r.data)
+
 export const createOrder = (data) => client.post('/orders', data).then((r) => r.data)
+
+/** Pay a takeaway order (requires open cashier shift + tables.pay). */
+export const payTakeawayOrder = (id, data) =>
+  client.post(`/orders/${id}/pay`, data).then((r) => r.data)
 
 export const updateStatus = (id, status, opts = {}) =>
   client

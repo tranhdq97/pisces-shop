@@ -6,7 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.core.permissions import Permission
 from app.core.security import require_permission
-from app.modules.tables.schemas import TableCreate, TableRead, TableUpdate, TableWithStatus
+from app.modules.cashier.schemas import PayTableRequest
+from app.modules.tables.schemas import TableCreate, TablePayResponse, TableRead, TableUpdate, TableWithStatus
 from app.modules.tables.service import TableService
 
 router = APIRouter(prefix="/tables", tags=["Tables"])
@@ -45,14 +46,29 @@ async def create_table(
     return TableRead.model_validate(table)
 
 
-@router.patch("/{table_id}/pay", response_model=TableRead, dependencies=[_tables_pay])
+@router.patch("/{table_id}/pay", response_model=TablePayResponse, dependencies=[_tables_pay])
 async def pay_table(
     table_id: uuid.UUID,
+    payload: PayTableRequest,
     db: AsyncSession = Depends(get_db),
-) -> TableRead:
+) -> TablePayResponse:
     service = TableService(db)
-    table = await service.pay_table(table_id)
-    return TableRead.model_validate(table)
+    table, payment = await service.pay_table(
+        table_id,
+        payment_method=payload.payment_method.value,
+        cash_amount=payload.cash_amount,
+        discount_type=payload.discount_type,
+        discount_value=payload.discount_value,
+    )
+    base = TableRead.model_validate(table).model_dump()
+    return TablePayResponse(
+        **base,
+        payment_id=payment.id,
+        total_amount=float(payment.total_amount),
+        cash_amount=float(payment.cash_amount),
+        transfer_amount=float(payment.transfer_amount),
+        payment_method=payment.payment_method,
+    )
 
 
 @router.patch("/{table_id}/clear", response_model=TableRead, dependencies=[_tables_clear])

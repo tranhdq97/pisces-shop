@@ -3,8 +3,8 @@ import { NavLink } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import {
   LayoutDashboard, UtensilsCrossed, ClipboardList,
-  CheckSquare, Users, ShieldCheck, X, Globe, Armchair, Package,
-  Banknote, ChefHat, TrendingUp, MonitorCheck, Truck, Images,
+  CheckSquare, Users, ShieldCheck, X, Globe, Package,
+  Banknote, ChefHat, TrendingUp, MonitorCheck, Truck, Images, Wallet,
 } from 'lucide-react'
 import { useAuth } from '../hooks/useAuth'
 import { useT, LANG_OPTIONS } from '../i18n'
@@ -14,9 +14,9 @@ import { getPendingUsers } from '../api/auth'
 const NAV_ITEMS = [
   { to: '/',           labelKey: 'nav.dashboard',  icon: LayoutDashboard, permission: 'dashboard.view' },
   { to: '/menu',       labelKey: 'nav.menu',        icon: UtensilsCrossed, permission: 'menu.view'      },
-  { to: '/orders',     labelKey: 'nav.orders',      icon: ClipboardList,   permission: 'orders.view'    },
+  { to: '/orders',     labelKey: 'nav.orders',      icon: ClipboardList,   permission: 'orders.view', altPermission: 'tables.view' },
   { to: '/kitchen',    labelKey: 'nav.kitchen',     icon: MonitorCheck,    permission: 'orders.start'   },
-  { to: '/tables',     labelKey: 'nav.tables',      icon: Armchair,        permission: 'tables.view'    },
+  { to: '/cashier',    labelKey: 'nav.cashier',     icon: Wallet,          permission: 'cashier.view'   },
   { to: '/inventory',  labelKey: 'nav.inventory',   icon: Package,         permission: 'inventory.view' },
   { to: '/suppliers',  labelKey: 'nav.suppliers',   icon: Truck,           permission: 'inventory.view' },
   { to: '/recipes',    labelKey: 'nav.recipes',     icon: ChefHat,         permission: 'recipe.view'    },
@@ -45,7 +45,9 @@ export default function Sidebar({ open, onClose }) {
 
   const visibleItems = NAV_ITEMS.filter((item) => {
     if (item.superadminOnly) return user?.role === 'superadmin'
-    return permissions.includes(item.permission)
+    if (permissions.includes(item.permission)) return true
+    if (item.altPermission && permissions.includes(item.altPermission)) return true
+    return false
   })
 
   return (

@@ -116,6 +116,15 @@ export default function Financials() {
   const isLoading = mode === 'year' ? yearlyLoading : pnlLoading
   const isProfit = (summary?.net_profit ?? 0) >= 0
   const activeTemplates = templates.filter((tmpl) => tmpl.is_active)
+  const customCostsSorted = [...(pnl?.custom_costs ?? [])].sort((a, b) => {
+    const da = a.entry_date ? Date.parse(`${a.entry_date}T00:00:00`) : 0
+    const db = b.entry_date ? Date.parse(`${b.entry_date}T00:00:00`) : 0
+    if (da !== db) return db - da
+    const ca = a.created_at ? Date.parse(a.created_at) : 0
+    const cb = b.created_at ? Date.parse(b.created_at) : 0
+    if (ca !== cb) return cb - ca
+    return String(b.id).localeCompare(String(a.id))
+  })
 
   // ── Chart data ────────────────────────────────────────────────────────────
 
@@ -516,7 +525,7 @@ export default function Financials() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
-                    {pnl?.custom_costs?.map((entry) => (
+                    {customCostsSorted.map((entry) => (
                       <tr key={entry.id} className="hover:bg-slate-50">
                         <td className="py-2.5 pr-4 font-medium text-slate-700">{entry.name}</td>
                         <td className="py-2.5 pr-4 text-right tabular-nums text-slate-700">{entry.quantity ?? 1}</td>

@@ -13,7 +13,7 @@ from app.core.base_model import Base
 class OrderFlow(StrEnum):
     """How the order is fulfilled (stored per order; default comes from settings)."""
     DINE_IN  = "dine_in"   # table service, multi-step kitchen / payment flow
-    TAKEAWAY = "takeaway"  # counter / take-out: created completed, no table
+    TAKEAWAY = "takeaway"  # counter / take-out: no table; pay at create or later
 
 
 class OrderStatus(StrEnum):

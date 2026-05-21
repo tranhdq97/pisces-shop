@@ -30,6 +30,9 @@ class RecipeItem(Base):
     )
     quantity: Mapped[float] = mapped_column(Numeric(10, 3), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Same non-null substitute_group on one menu item = OR alternatives (priority 0 first).
+    substitute_group: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     menu_item: Mapped["MenuItem"] = relationship("MenuItem", foreign_keys=[menu_item_id], lazy="raise")  # type: ignore[name-defined]
     stock_item: Mapped["StockItem"] = relationship("StockItem", foreign_keys=[stock_item_id], lazy="raise")  # type: ignore[name-defined]

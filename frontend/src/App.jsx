@@ -9,7 +9,7 @@ import ForgotPassword from './pages/ForgotPassword'
 import Dashboard from './pages/Dashboard'
 import Menu from './pages/Menu'
 import Orders from './pages/Orders'
-import Tables from './pages/Tables'
+import Cashier from './pages/Cashier'
 import Inventory from './pages/Inventory'
 import Suppliers from './pages/Suppliers'
 import Kitchen from './pages/Kitchen'
@@ -26,7 +26,7 @@ const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: 1, staleTime: 30_000 } },
 })
 
-function ProtectedRoute({ children, permission }) {
+function ProtectedRoute({ children, permission, anyOf }) {
   const { user, loading } = useAuth()
 
   if (loading) return (
@@ -37,10 +37,14 @@ function ProtectedRoute({ children, permission }) {
 
   if (!user) return <Navigate to="/login" replace />
 
-  if (permission && !user.permissions?.includes(permission)) {
-    const perms = user.permissions ?? []
+  const perms = user.permissions ?? []
+  const allowed = anyOf?.length
+    ? anyOf.some((p) => perms.includes(p))
+    : !permission || perms.includes(permission)
+
+  if (!allowed) {
     const fallback = perms.includes('dashboard.view') ? '/'
-      : perms.includes('orders.view') ? '/orders'
+      : perms.includes('orders.view') || perms.includes('tables.view') ? '/orders'
       : '/sop'
     return <Navigate to={fallback} replace />
   }
@@ -106,14 +110,16 @@ export default function App() {
               } />
 
               <Route path="/orders" element={
-                <ProtectedRoute permission="orders.view">
+                <ProtectedRoute anyOf={['orders.view', 'tables.view']}>
                   <Orders />
                 </ProtectedRoute>
               } />
 
-              <Route path="/tables" element={
-                <ProtectedRoute permission="tables.view">
-                  <Tables />
+              <Route path="/tables" element={<Navigate to="/orders?mode=dine_in" replace />} />
+
+              <Route path="/cashier" element={
+                <ProtectedRoute permission="cashier.view">
+                  <Cashier />
                 </ProtectedRoute>
               } />
 

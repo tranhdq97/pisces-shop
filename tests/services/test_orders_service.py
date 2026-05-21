@@ -9,8 +9,11 @@ from app.core.exceptions import AppException
 from app.modules.menu.schemas import CategoryCreate, MenuItemCreate
 from app.modules.menu.service import MenuService
 from app.modules.orders.models import OrderFlow, OrderStatus
-from app.modules.orders.schemas import OrderCreate, OrderItemSchema, OrderUpdateStatus
+from app.modules.orders.schemas import OrderCreate, OrderItemSchema, OrderPay, OrderUpdateStatus
 from app.modules.orders.service import OrderService
+from app.modules.cashier.models import PaymentMethod
+from app.modules.cashier.schemas import ShiftOpen
+from app.modules.cashier.service import CashierService
 from app.modules.orders.shop_settings_service import ShopSettingsService
 from app.modules.tables.models import Table
 
@@ -33,6 +36,10 @@ async def _make_table(db, name=None):
     await db.flush()
     await db.refresh(table)
     return table
+
+
+async def _open_shift(db):
+    await CashierService(db).open_shift(ShiftOpen(opening_cash=Decimal("0"), opening_transfer=Decimal("0")))
 
 
 async def _order(db, item_id, qty=2, table=None):
@@ -78,12 +85,28 @@ async def test_create_order_sets_pending_status(db_session):
     assert order.order_flow == OrderFlow.DINE_IN
 
 
-async def test_create_takeaway_completed_no_table(db_session):
+async def test_create_takeaway_pending_without_payment(db_session):
     item = await _menu_item(db_session)
     order = await OrderService(db_session).create_order(
         OrderCreate(
             order_flow=OrderFlow.TAKEAWAY,
             details=[OrderItemSchema(item_id=item.id, qty=2)],
+        ),
+    )
+    assert order.status == OrderStatus.PENDING
+    assert order.table_id is None
+    assert order.order_flow == OrderFlow.TAKEAWAY
+    assert order.details[0].get("served_qty", 0) == 0
+
+
+async def test_create_takeaway_pay_now_completed(db_session):
+    item = await _menu_item(db_session)
+    await _open_shift(db_session)
+    order = await OrderService(db_session).create_order(
+        OrderCreate(
+            order_flow=OrderFlow.TAKEAWAY,
+            details=[OrderItemSchema(item_id=item.id, qty=2)],
+            payment_method=PaymentMethod.CASH,
         ),
     )
     assert order.status == OrderStatus.COMPLETED
@@ -92,14 +115,33 @@ async def test_create_takeaway_completed_no_table(db_session):
     assert order.details[0]["served_qty"] == 2
 
 
+async def test_pay_takeaway_later(db_session):
+    item = await _menu_item(db_session)
+    await _open_shift(db_session)
+    order = await OrderService(db_session).create_order(
+        OrderCreate(
+            order_flow=OrderFlow.TAKEAWAY,
+            details=[OrderItemSchema(item_id=item.id, qty=1)],
+        ),
+    )
+    assert order.status == OrderStatus.PENDING
+    paid = await OrderService(db_session).pay_takeaway(
+        order.id, OrderPay(payment_method=PaymentMethod.TRANSFER)
+    )
+    assert paid.status == OrderStatus.COMPLETED
+    assert paid.details[0]["served_qty"] == 1
+
+
 async def test_create_order_uses_shop_default_when_flow_omitted(db_session):
     item = await _menu_item(db_session)
     await ShopSettingsService(db_session).set_default_order_flow(OrderFlow.TAKEAWAY)
     order = await OrderService(db_session).create_order(
-        OrderCreate(details=[OrderItemSchema(item_id=item.id, qty=1)]),
+        OrderCreate(
+            details=[OrderItemSchema(item_id=item.id, qty=1)],
+        ),
     )
     assert order.order_flow == OrderFlow.TAKEAWAY
-    assert order.status == OrderStatus.COMPLETED
+    assert order.status == OrderStatus.PENDING
     assert order.table_id is None
 
 

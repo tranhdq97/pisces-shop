@@ -9,6 +9,8 @@ class RecipeIngredient(BaseModel):
     stock_item_id: uuid.UUID
     quantity: float = Field(..., gt=0)
     notes: str | None = None
+    substitute_group: int | None = Field(default=None, ge=1)
+    priority: int = Field(default=0, ge=0)
 
 
 class RecipeItemRead(BaseModel):
@@ -18,6 +20,8 @@ class RecipeItemRead(BaseModel):
     stock_item_unit: str
     quantity: float
     notes: str | None
+    substitute_group: int | None = None
+    priority: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -56,6 +60,9 @@ class IngredientCostLine(BaseModel):
     recipe_quantity: float           # quantity per 1 unit of menu item
     last_unit_price: Optional[float]  # most recent intake price, None if no data
     line_cost: Optional[float]        # last_unit_price * recipe_quantity
+    substitute_group: Optional[int] = None
+    priority: int = 0
+    is_substitute: bool = False
 
 
 class RecipeCostRead(BaseModel):
@@ -65,4 +72,3 @@ class RecipeCostRead(BaseModel):
     ingredients: list[IngredientCostLine]
     total_cost: Optional[float]      # None if any ingredient is missing price data
     margin_pct: Optional[float]      # None if total_cost is None or selling_price == 0
-

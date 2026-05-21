@@ -5,7 +5,7 @@ export const getTables = () =>
 
 export const createTable = (data) => client.post('/tables', data).then((r) => r.data)
 
-export const payTable   = (id)  => client.patch(`/tables/${id}/pay`).then((r) => r.data)
+export const payTable   = (id, data)  => client.patch(`/tables/${id}/pay`, data).then((r) => r.data)
 
 export const clearTable = (id)  => client.patch(`/tables/${id}/clear`).then((r) => r.data)
 

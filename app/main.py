@@ -22,6 +22,7 @@ from app.modules.tables.router import router as tables_router
 from app.modules.inventory.router import router as inventory_router
 from app.modules.financials.router import router as financials_router
 from app.modules.about.router import router as about_router
+from app.modules.cashier.router import router as cashier_router
 
 FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
 
@@ -78,6 +79,7 @@ def create_app() -> FastAPI:
     app.include_router(recipes_router,   prefix="/api/v1")
     app.include_router(financials_router, prefix="/api/v1")
     app.include_router(about_router, prefix="/api/v1")
+    app.include_router(cashier_router, prefix="/api/v1")
 
     @app.get("/health", tags=["Health"])
     async def health_check() -> dict[str, str]:

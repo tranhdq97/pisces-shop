@@ -17,6 +17,15 @@ async def _make_item(db_session):
     )
 
 
+async def _open_cashier_shift(client, token):
+    r = await client.post(
+        "/api/v1/cashier/shift/open",
+        json={"opening_cash": 0, "opening_transfer": 0},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+
+
 # ---------------------------------------------------------------------------
 # POST /orders
 # ---------------------------------------------------------------------------
@@ -82,7 +91,7 @@ async def test_create_order_without_flow_uses_shop_takeaway_default(client, mana
     assert r.status_code == 201
     data = r.json()
     assert data["order_flow"] == "takeaway"
-    assert data["status"] == "completed"
+    assert data["status"] == "pending"
     assert data["table_id"] is None
 
 
@@ -100,11 +109,34 @@ async def test_create_takeaway_with_table_returns_422(client, waiter_token, db_s
     assert r.status_code == 422
 
 
-async def test_create_takeaway_order_completed_no_table(client, waiter_token, db_session):
+async def test_create_takeaway_pending_without_payment(client, waiter_token, db_session):
     item = await _make_item(db_session)
     r = await client.post(
         "/api/v1/orders",
-        json={"order_flow": "takeaway", "details": [{"item_id": str(item.id), "qty": 1}]},
+        json={
+            "order_flow": "takeaway",
+            "details": [{"item_id": str(item.id), "qty": 1}],
+        },
+        headers={"Authorization": f"Bearer {waiter_token}"},
+    )
+    assert r.status_code == 201
+    data = r.json()
+    assert data["status"] == "pending"
+    assert data["order_flow"] == "takeaway"
+    assert data["table_id"] is None
+    assert data["details"][0]["served_qty"] == 0
+
+
+async def test_create_takeaway_pay_now_completed(client, waiter_token, db_session):
+    item = await _make_item(db_session)
+    await _open_cashier_shift(client, waiter_token)
+    r = await client.post(
+        "/api/v1/orders",
+        json={
+            "order_flow": "takeaway",
+            "details": [{"item_id": str(item.id), "qty": 1}],
+            "payment_method": "transfer",
+        },
         headers={"Authorization": f"Bearer {waiter_token}"},
     )
     assert r.status_code == 201
@@ -114,6 +146,28 @@ async def test_create_takeaway_order_completed_no_table(client, waiter_token, db
     assert data["table_id"] is None
     assert data["table_name"] is None
     assert data["details"][0]["served_qty"] == 1
+
+
+async def test_pay_takeaway_later(client, waiter_token, db_session):
+    item = await _make_item(db_session)
+    create = await client.post(
+        "/api/v1/orders",
+        json={
+            "order_flow": "takeaway",
+            "details": [{"item_id": str(item.id), "qty": 1}],
+        },
+        headers={"Authorization": f"Bearer {waiter_token}"},
+    )
+    assert create.status_code == 201
+    order_id = create.json()["id"]
+    await _open_cashier_shift(client, waiter_token)
+    pay = await client.post(
+        f"/api/v1/orders/{order_id}/pay",
+        json={"payment_method": "cash"},
+        headers={"Authorization": f"Bearer {waiter_token}"},
+    )
+    assert pay.status_code == 200
+    assert pay.json()["status"] == "completed"
 
 
 async def test_create_order_requires_auth(client, db_session, test_table):

@@ -1,6 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Plus, Clock, Utensils, ChefHat, Ban, Pencil, User, Truck, Trash2, Download, CheckCircle2, Settings, Tag } from 'lucide-react'
+import { Plus, Clock, Ban, Pencil, User, Trash2, Download, CheckCircle2, Tag, Banknote, Armchair, ShoppingBag, Settings } from 'lucide-react'
 import Layout from '../components/Layout'
 import Modal from '../components/Modal'
 import Button from '../components/Button'
@@ -8,9 +9,13 @@ import Badge from '../components/Badge'
 import Input from '../components/Input'
 import MoneyInput from '../components/MoneyInput'
 import Spinner from '../components/Spinner'
-import { getOrders, getOrderFormDefaults, patchOrderFormDefaults, createOrder, updateStatus, updateOrderItems, deleteOrder, serveOrderItem, patchOrderDiscount } from '../api/orders'
+import DineInFloor from '../components/DineInFloor'
+import { getOrders, getOrderFormDefaults, patchOrderFormDefaults, createOrder, updateStatus, updateOrderItems, deleteOrder, serveOrderItem, patchOrderDiscount, getOrderPayment, payTakeawayOrder } from '../api/orders'
+import { updatePayment } from '../api/cashier'
 import { getCategories, getItems } from '../api/menu'
+import { getRecipe } from '../api/recipes'
 import { getTables } from '../api/tables'
+import { getCurrentShift } from '../api/cashier'
 import { getAllUsers } from '../api/auth'
 import { useT } from '../i18n'
 import { useAuth } from '../hooks/useAuth'
@@ -52,7 +57,69 @@ function orderTotals(order) {
   return { subtotal, discountAmount: 0, total: subtotal, hasDiscount: false }
 }
 
-/** Cap cart qty to per-item max_orderable_qty (min over recipe lines vs stock). */
+/** Cart line: { qty, ingredientAdjustments?: { [stockItemId]: number } } */
+function cartEntryQty(cart, id) {
+  const e = cart[id]
+  if (!e) return 0
+  return typeof e === 'number' ? e : (e.qty ?? 0)
+}
+
+function setCartEntryQty(cart, id, qty) {
+  const prev = cart[id]
+  const extras = typeof prev === 'object' && prev ? { ingredientAdjustments: prev.ingredientAdjustments } : {}
+  if (qty <= 0) {
+    const { [id]: _, ...rest } = cart
+    return rest
+  }
+  if (typeof prev === 'object' && prev) return { ...cart, [id]: { ...prev, qty } }
+  return { ...cart, [id]: { qty, ...extras } }
+}
+
+function cartToDetails(cart) {
+  return Object.entries(cart)
+    .map(([item_id, val]) => {
+      const qty = cartEntryQty({ [item_id]: val }, item_id)
+      const detail = { item_id, qty }
+      const adj = typeof val === 'object' && val?.ingredientAdjustments
+      if (adj && Object.keys(adj).length) {
+        detail.ingredient_adjustments = Object.entries(adj).map(([stock_item_id, quantity]) => ({
+          stock_item_id,
+          quantity: Number(quantity),
+        }))
+      }
+      return detail
+    })
+    .filter((d) => d.qty > 0)
+}
+
+function orderDetailsToCart(details) {
+  const cart = {}
+  for (const d of details ?? []) {
+    const entry = { qty: d.qty }
+    if (d.ingredient_adjustments?.length) {
+      entry.ingredientAdjustments = Object.fromEntries(
+        d.ingredient_adjustments.map((a) => [a.stock_item_id, a.quantity]),
+      )
+    }
+    cart[d.item_id] = entry
+  }
+  return cart
+}
+
+function ingredientStep(baseQty) {
+  const n = Number(baseQty)
+  if (n >= 10) return 1
+  if (n >= 1) return 0.1
+  return 0.01
+}
+
+function fmtIngredientQty(n) {
+  const v = Number(n)
+  if (Number.isNaN(v)) return '0'
+  return Number(v.toFixed(3)).toString()
+}
+
+/** Cap cart qty to max_orderable_qty from API (AND + OR substitute groups). */
 function clampCartToMaxStock(cart, items) {
   if (!items?.length) return cart
   let changed = false
@@ -62,10 +129,11 @@ function clampCartToMaxStock(cart, items) {
     if (!row) continue
     if (row.max_orderable_qty == null || row.max_orderable_qty === undefined) continue
     const cap = Math.max(0, Number(row.max_orderable_qty))
-    if (next[id] > cap) {
+    const qty = cartEntryQty(next, id)
+    if (qty > cap) {
       changed = true
       if (cap <= 0) delete next[id]
-      else next[id] = cap
+      else next[id] = typeof next[id] === 'number' ? { qty: cap } : { ...next[id], qty: cap }
     }
   }
   return changed ? next : cart
@@ -82,10 +150,16 @@ const todayStr = () => new Date().toLocaleDateString('en-CA')
 const fmtDayHeader = (isoDay) =>
   new Date(isoDay + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
 
-const STATUS_TABS = ['pending', 'in_progress', 'delivered', 'completed', 'cancelled']
+const ALL_STATUSES = ['pending', 'in_progress', 'delivered', 'completed', 'cancelled']
+const OPEN_STATUSES = ['pending', 'in_progress', 'delivered']
+const PAYMENT_METHODS = ['transfer', 'cash', 'mixed']
+const DEFAULT_PAYMENT_METHOD = 'transfer'
 
 // ──────────────────────────────────────────────────────────────────────────────
-function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onCancelCompleted, onServeItem, servingItem, t, canEdit, canStart, isSuperadmin, usersMap }) {
+function OrderCard({
+  order, onAction, onEditItems, onEditDiscount, onEditPayment, onDelete, onCancelCompleted,
+  onServeItem, onPayTakeaway, servingItem, t, canEdit, canStart, canPay, isSuperadmin, usersMap,
+}) {
   const [serveDialog, setServeDialog] = useState(null) // { itemId, name, remaining }
   const [serveQty, setServeQty] = useState(1)
 
@@ -103,15 +177,18 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
   // Each action has an optional `perm` to control which permission is needed.
   // perm: 'start' | 'edit' | 'superadmin'
   // action: 'delete' | 'cancel_completed' (else falls back to status transition)
+  const isTakeaway = order.order_flow === 'takeaway'
+  const completeLabel = isTakeaway ? 'orders.complete_ready_btn' : 'orders.deliver_btn'
   const ACTIONS = {
     pending:     [{ labelKey: 'orders.start',       status: 'in_progress', variant: 'primary', perm: 'start' },
                   { labelKey: 'orders.cancel_btn',  status: 'cancelled',   variant: 'danger',  perm: 'edit'  }],
-    in_progress: [{ labelKey: 'orders.deliver_btn', status: 'delivered',   variant: 'success', perm: 'edit'  },
+    in_progress: [{ labelKey: completeLabel,        status: 'delivered',   variant: 'success', perm: 'edit'  },
                   { labelKey: 'orders.cancel_btn',  status: 'cancelled',   variant: 'danger',  perm: 'edit'  }],
     delivered:   [{ labelKey: 'orders.cancel_btn',  status: 'cancelled',   variant: 'danger',  perm: 'edit'  }],
     completed:   [{ labelKey: 'orders.cancel_completed_btn', action: 'cancel_completed', variant: 'danger', perm: 'superadmin' }],
     cancelled:   [{ labelKey: 'orders.delete_btn', action: 'delete', variant: 'danger', perm: 'edit' }],
   }
+  const showTakeawayPay = isTakeaway && canPay && !['completed', 'cancelled'].includes(order.status)
 
   const actions = (ACTIONS[order.status] ?? []).filter((a) => {
     if (a.perm === 'start') return canStart
@@ -164,6 +241,19 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
                 )}
                 <span className={`flex-1 ${done ? 'line-through text-muted' : ''}`}>
                   {d.qty}× {d.name}
+                  {d.ingredient_adjustments?.length > 0 && (
+                    <span className="block text-xs text-amber-700 font-normal mt-0.5">
+                      {d.ingredient_adjustments.map((a) => (
+                        <span key={a.stock_item_id} className="block">
+                          {a.stock_item_name}: {fmtIngredientQty(a.quantity)} {a.stock_item_unit}
+                          {' '}
+                          <span className="text-amber-600/80">
+                            ({t('orders.ingredient_was', { n: fmtIngredientQty(a.recipe_quantity) })})
+                          </span>
+                        </span>
+                      ))}
+                    </span>
+                  )}
                   {servedQty > 0 && !done && (
                     <span className="ml-1.5 text-xs text-amber-600 font-medium">
                       ({t('orders.served_progress', { served: servedQty, total: d.qty })})
@@ -191,7 +281,7 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
         </ul>
 
         {order.note && (
-          <p className="text-xs text-amber-700 bg-amber-50 rounded-lg px-3 py-2">
+          <p className="text-sm text-amber-800 bg-amber-50 rounded-lg px-3 py-2 break-words whitespace-pre-wrap">
             {t('orders.note_label')} {order.note}
           </p>
         )}
@@ -215,6 +305,11 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
             )}
           </div>
           <div className="flex flex-wrap gap-2">
+            {order.status === 'completed' && isSuperadmin && (
+              <Button size="sm" variant="secondary" onClick={() => onEditPayment(order)}>
+                <Banknote size={13} /> {t('orders.edit_payment')}
+              </Button>
+            )}
             {canEditDiscount && (
               <Button size="sm" variant="secondary" onClick={() => onEditDiscount(order)}>
                 <Tag size={13} /> {t('orders.edit_discount')}
@@ -223,6 +318,11 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
             {canEditItems && (
               <Button size="sm" variant="secondary" onClick={() => onEditItems(order)}>
                 <Pencil size={13} /> {t('orders.edit_items')}
+              </Button>
+            )}
+            {showTakeawayPay && (
+              <Button size="sm" variant="primary" onClick={() => onPayTakeaway(order)}>
+                <Banknote size={13} /> {t('orders.pay_takeaway_btn')}
               </Button>
             )}
             {actions.map((a) => (
@@ -306,9 +406,110 @@ function OrderCard({ order, onAction, onEditItems, onEditDiscount, onDelete, onC
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+function IngredientCustomizePanel({ itemId, itemName, cart, setCart, t }) {
+  const { data: recipe, isLoading } = useQuery({
+    queryKey: ['recipe', itemId],
+    queryFn: () => getRecipe(itemId),
+    enabled: Boolean(itemId),
+  })
+
+  const entry = cart[itemId]
+  const overrides = (typeof entry === 'object' && entry?.ingredientAdjustments) || {}
+
+  const setOverride = (stockItemId, baseQty, delta) => {
+    const step = ingredientStep(baseQty)
+    setCart((c) => {
+      const cur = c[itemId]
+      const qty = cartEntryQty(c, itemId)
+      const prevAdj = typeof cur === 'object' && cur?.ingredientAdjustments ? { ...cur.ingredientAdjustments } : {}
+      const current = prevAdj[stockItemId] ?? baseQty
+      const nextVal = Math.max(0, Math.round((current + delta * step) * 1000) / 1000)
+      const nextAdj = { ...prevAdj }
+      if (Math.abs(nextVal - baseQty) <= 1e-9) delete nextAdj[stockItemId]
+      else nextAdj[stockItemId] = nextVal
+      return {
+        ...c,
+        [itemId]: {
+          qty,
+          ...(Object.keys(nextAdj).length ? { ingredientAdjustments: nextAdj } : {}),
+        },
+      }
+    })
+  }
+
+  if (isLoading) {
+    return <p className="text-xs text-muted px-3 py-2">{t('orders.ingredients_loading')}</p>
+  }
+  if (!recipe?.ingredients?.length) {
+    return <p className="text-xs text-muted px-3 py-2">{t('orders.no_recipe_ingredients')}</p>
+  }
+
+  const orGroups = new Map()
+  const andIngredients = []
+  for (const ing of recipe.ingredients) {
+    if (ing.substitute_group != null) {
+      const g = ing.substitute_group
+      if (!orGroups.has(g)) orGroups.set(g, [])
+      orGroups.get(g).push(ing)
+    } else {
+      andIngredients.push(ing)
+    }
+  }
+
+  return (
+    <div className="mx-3 mb-2 rounded-lg border border-amber-200 bg-amber-50/60 px-3 py-2 space-y-1.5">
+      <p className="text-xs font-medium text-amber-900">{t('orders.customize_ingredients', { name: itemName })}</p>
+      {andIngredients.map((ing) => {
+        const base = Number(ing.quantity)
+        const effective = overrides[ing.stock_item_id] ?? base
+        const changed = Math.abs(effective - base) > 1e-9
+        return (
+          <div key={ing.stock_item_id} className="flex items-center justify-between gap-2 text-xs">
+            <span className={`min-w-0 truncate ${changed ? 'text-amber-900 font-medium' : 'text-slate-600'}`}>
+              {ing.stock_item_name}
+              <span className="text-muted ml-1">({ing.stock_item_unit})</span>
+            </span>
+            <div className="flex items-center gap-1 flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => setOverride(ing.stock_item_id, base, -1)}
+                disabled={effective <= 0}
+                className="h-6 w-6 rounded border border-amber-200 text-slate-600 hover:bg-amber-100 text-sm font-bold disabled:opacity-30"
+              >
+                −
+              </button>
+              <span className="w-14 text-center font-medium tabular-nums">{fmtIngredientQty(effective)}</span>
+              <button
+                type="button"
+                onClick={() => setOverride(ing.stock_item_id, base, 1)}
+                className="h-6 w-6 rounded border border-amber-200 text-slate-600 hover:bg-amber-100 text-sm font-bold"
+              >
+                +
+              </button>
+            </div>
+          </div>
+        )
+      })}
+      {[...orGroups.entries()].map(([groupId, opts]) => (
+        <div key={`or-${groupId}`} className="text-xs text-slate-600 border-l-2 border-amber-300 pl-2">
+          <p className="font-medium text-amber-800">{t('orders.or_substitutes_label')}</p>
+          <p className="text-muted mt-0.5">
+            {opts
+              .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0))
+              .map((o) => o.stock_item_name)
+              .join(` ${t('recipes.or_badge')} `)}
+          </p>
+          <p className="text-muted mt-0.5">{t('orders.or_substitutes_hint')}</p>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function ItemSelector({ categories, items, cart, setCart, t }) {
   const [search, setSearch] = useState('')
   const [activeCat, setActiveCat] = useState(null)
+  const [customizeItemId, setCustomizeItemId] = useState(null)
   const effectiveCat = activeCat ?? categories[0]?.id
 
   const visibleItems = items.filter((i) =>
@@ -325,12 +526,15 @@ function ItemSelector({ categories, items, cart, setCart, t }) {
         row?.max_orderable_qty != null && row?.max_orderable_qty !== undefined
           ? Math.max(0, Number(row.max_orderable_qty))
           : null
-      const cur = c[id] ?? 0
+      const cur = cartEntryQty(c, id)
       if (delta > 0 && cap != null && cur >= cap) return c
       const next = cur + delta
-      if (next <= 0) { const { [id]: _, ...rest } = c; return rest }
-      if (cap != null && next > cap) return { ...c, [id]: cap }
-      return { ...c, [id]: next }
+      if (next <= 0) {
+        if (customizeItemId === id) setCustomizeItemId(null)
+        return setCartEntryQty(c, id, 0)
+      }
+      const capped = cap != null && next > cap ? cap : next
+      return setCartEntryQty(c, id, capped)
     })
 
   return (
@@ -359,54 +563,84 @@ function ItemSelector({ categories, items, cart, setCart, t }) {
         onChange={(e) => setSearch(e.target.value)}
         className="w-full h-9 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500 mb-2"
       />
-      <div className="space-y-1 max-h-48 overflow-y-auto">
+      <div className="space-y-1 max-h-64 overflow-y-auto">
         {visibleItems.map((item) => {
-          const qty = cart[item.id] ?? 0
+          const qty = cartEntryQty(cart, item.id)
+          const entry = cart[item.id]
+          const hasCustom =
+            typeof entry === 'object'
+            && entry?.ingredientAdjustments
+            && Object.keys(entry.ingredientAdjustments).length > 0
           const stockOk = item.ingredients_available !== false
           const cap =
             item.max_orderable_qty != null && item.max_orderable_qty !== undefined
               ? Math.max(0, Number(item.max_orderable_qty))
               : null
           const atCap = cap != null && qty >= cap
+          const expanded = customizeItemId === item.id
           return (
-            <div
-              key={item.id}
-              className={`flex items-center justify-between rounded-lg px-3 py-2 ${
-                stockOk ? 'hover:bg-slate-50' : 'bg-slate-50/80 opacity-75'
-              }`}
-            >
-              <div className="min-w-0 pr-2">
-                <p className={`text-sm ${stockOk ? 'text-slate-700' : 'text-slate-500'}`}>{item.name}</p>
-                <p className="text-xs text-muted">{currency(item.price)}</p>
-                {cap != null && stockOk && (
-                  <p className="text-xs text-slate-500 mt-0.5">{t('orders.max_portions_stock', { n: cap })}</p>
-                )}
-                {!stockOk && (
-                  <p className="text-xs font-medium text-amber-700 mt-0.5">{t('orders.sold_out_ingredients')}</p>
-                )}
+            <div key={item.id}>
+              <div
+                className={`flex items-center justify-between rounded-lg px-3 py-2 ${
+                  stockOk ? 'hover:bg-slate-50' : 'bg-slate-50/80 opacity-75'
+                }`}
+              >
+                <div className="min-w-0 pr-2">
+                  <p className={`text-sm ${stockOk ? 'text-slate-700' : 'text-slate-500'}`}>{item.name}</p>
+                  <p className="text-xs text-muted">{currency(item.price)}</p>
+                  {cap != null && stockOk && (
+                    <p className="text-xs text-slate-500 mt-0.5">{t('orders.max_portions_stock', { n: cap })}</p>
+                  )}
+                  {!stockOk && (
+                    <p className="text-xs font-medium text-amber-700 mt-0.5">{t('orders.sold_out_ingredients')}</p>
+                  )}
+                  {hasCustom && (
+                    <p className="text-xs font-medium text-amber-700 mt-0.5">{t('orders.ingredients_customized')}</p>
+                  )}
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {qty > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => setCustomizeItemId(expanded ? null : item.id)}
+                        className={`text-xs px-2 py-1 rounded-md border transition-colors ${
+                          expanded || hasCustom
+                            ? 'border-amber-300 bg-amber-50 text-amber-800'
+                            : 'border-border text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {t('orders.ingredients_btn')}
+                      </button>
+                      <button type="button" onClick={() => setQty(item.id, -1)}
+                        className="h-7 w-7 rounded-full border border-border text-slate-600 hover:bg-slate-100 text-sm font-bold">−</button>
+                      <span className="w-5 text-center text-sm font-medium">{qty}</span>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setQty(item.id, 1)}
+                    disabled={!stockOk || atCap}
+                    title={
+                      !stockOk
+                        ? t('orders.sold_out_ingredients')
+                        : atCap
+                          ? t('orders.max_portions_stock', { n: cap })
+                          : undefined
+                    }
+                    className="h-7 w-7 rounded-full bg-brand-500 text-white hover:bg-brand-600 text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-500"
+                  >+</button>
+                </div>
               </div>
-              <div className="flex items-center gap-2 flex-shrink-0">
-                {qty > 0 && (
-                  <>
-                    <button type="button" onClick={() => setQty(item.id, -1)}
-                      className="h-7 w-7 rounded-full border border-border text-slate-600 hover:bg-slate-100 text-sm font-bold">−</button>
-                    <span className="w-5 text-center text-sm font-medium">{qty}</span>
-                  </>
-                )}
-                <button
-                  type="button"
-                  onClick={() => setQty(item.id, 1)}
-                  disabled={!stockOk || atCap}
-                  title={
-                    !stockOk
-                      ? t('orders.sold_out_ingredients')
-                      : atCap
-                        ? t('orders.max_portions_stock', { n: cap })
-                        : undefined
-                  }
-                  className="h-7 w-7 rounded-full bg-brand-500 text-white hover:bg-brand-600 text-sm font-bold disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-500"
-                >+</button>
-              </div>
+              {expanded && qty > 0 && (
+                <IngredientCustomizePanel
+                  itemId={item.id}
+                  itemName={item.name}
+                  cart={cart}
+                  setCart={setCart}
+                  t={t}
+                />
+              )}
             </div>
           )
         })}
@@ -416,7 +650,7 @@ function ItemSelector({ categories, items, cart, setCart, t }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
+function NewOrderModal({ open, onClose, t, defaultOrderFlow, forceFlow, prefillTableId }) {
   const qc = useQueryClient()
   const [tableId, setTableId] = useState('')
   const [orderFlow, setOrderFlow] = useState('dine_in')
@@ -426,16 +660,40 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
   const [discountVal, setDiscountVal] = useState('')
   const [error, setError]     = useState('')
   const [submitBusy, setSubmitBusy] = useState(false)
+  const [payNow, setPayNow] = useState(false)
+  const [paymentMethod, setPaymentMethod] = useState(DEFAULT_PAYMENT_METHOD)
+  const [mixedCash, setMixedCash] = useState('')
 
   const { data: categories = [] } = useQuery({ queryKey: ['categories'], queryFn: getCategories })
   const { data: items = [] }      = useQuery({ queryKey: ['items', 'available'], queryFn: () => getItems(true) })
   const { data: tables = [] }     = useQuery({ queryKey: ['tables'], queryFn: getTables })
 
+  const isTakeaway = orderFlow === 'takeaway'
+  const flowLocked = !!forceFlow
+
+  const { data: openShift } = useQuery({
+    queryKey: ['cashier-shift'],
+    queryFn: getCurrentShift,
+    enabled: open && isTakeaway && payNow,
+  })
+
   useEffect(() => {
-    if (open && defaultOrderFlow) {
-      setOrderFlow(defaultOrderFlow)
+    if (!open) return
+    if (forceFlow) setOrderFlow(forceFlow)
+    else if (defaultOrderFlow) setOrderFlow(defaultOrderFlow)
+    if (prefillTableId) setTableId(prefillTableId)
+    else if (forceFlow === 'takeaway') setTableId('')
+  }, [open, forceFlow, defaultOrderFlow, prefillTableId])
+
+  useEffect(() => {
+    if (!open) {
+      setPaymentMethod(DEFAULT_PAYMENT_METHOD)
+      setMixedCash('')
+      setPayNow(false)
+      setTableId('')
+      setError('')
     }
-  }, [open, defaultOrderFlow])
+  }, [open])
 
   useEffect(() => {
     setCart((c) => clampCartToMaxStock(c, items))
@@ -443,8 +701,9 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
 
   const activeTables = tables.filter((tb) => tb.is_active)
 
-  const cartSubtotal = Object.entries(cart).reduce((s, [id, qty]) => {
+  const cartSubtotal = Object.keys(cart).reduce((s, id) => {
     const item = items.find((i) => i.id === id)
+    const qty = cartEntryQty(cart, id)
     return s + (item ? Number(item.price) * qty : 0)
   }, 0)
   const previewDisc = previewDiscountAmount(
@@ -458,19 +717,29 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
     mutationFn: (data) => createOrder(data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['orders'] })
+      qc.invalidateQueries({ queryKey: ['table-orders'] })
+      qc.invalidateQueries({ queryKey: ['tables'] })
       qc.invalidateQueries({ queryKey: ['items', 'available'] })
+      qc.invalidateQueries({ queryKey: ['cashier-shift'] })
       onClose()
       setCart({}); setTableId(''); setNote(''); setDiscountMode('none'); setDiscountVal(''); setError('')
+      setPaymentMethod(DEFAULT_PAYMENT_METHOD); setMixedCash(''); setPayNow(false)
     },
   })
 
-  const isTakeaway = orderFlow === 'takeaway'
+  const mixedCashNum = mixedCash === '' ? 0 : Number(mixedCash)
+  const mixedTransfer = Math.max(grandTotal - mixedCashNum, 0)
+  const canPayNow =
+    openShift && (paymentMethod !== 'mixed' || (mixedCashNum > 0 && mixedCashNum < grandTotal))
 
-  const submit = async (e) => {
-    e.preventDefault()
+  const submit = async (withPayment) => {
     setError('')
     if (!isTakeaway && !tableId) { setError(t('orders.err_table')); return }
-    const entries = Object.entries(cart)
+    if (isTakeaway && withPayment && !canPayNow) {
+      setError(t('tables.no_open_shift'))
+      return
+    }
+    const entries = Object.keys(cart).filter((id) => cartEntryQty(cart, id) > 0)
     if (entries.length === 0) { setError(t('orders.err_items')); return }
     setSubmitBusy(true)
     try {
@@ -481,13 +750,13 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
       const fresh = qc.getQueryData(['items', 'available']) ?? items
       const nextCart = clampCartToMaxStock({ ...cart }, fresh)
       setCart(nextCart)
-      const details = Object.entries(nextCart).map(([item_id, qty]) => ({ item_id, qty }))
+      const details = cartToDetails(nextCart)
       if (details.length === 0) {
         setError(t('orders.err_items'))
         return
       }
-      for (const [id, qty] of Object.entries(nextCart)) {
-        const row = fresh.find((i) => i.id === id)
+      for (const d of details) {
+        const row = fresh.find((i) => i.id === d.item_id)
         if (!row || row.ingredients_available === false) {
           setError(t('orders.sold_out_ingredients'))
           return
@@ -496,7 +765,7 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
           row.max_orderable_qty != null && row.max_orderable_qty !== undefined
             ? Math.max(0, Number(row.max_orderable_qty))
             : null
-        if (cap != null && qty > cap) {
+        if (cap != null && d.qty > cap) {
           setError(t('orders.err_qty_exceeds_stock', { name: row.name, n: cap }))
           return
         }
@@ -504,6 +773,10 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
       const body = isTakeaway
         ? { order_flow: 'takeaway', note: note || undefined, details }
         : { order_flow: 'dine_in', table_id: tableId, note: note || undefined, details }
+      if (isTakeaway && withPayment) {
+        body.payment_method = paymentMethod
+        if (paymentMethod === 'mixed') body.cash_amount = mixedCashNum
+      }
       if (discountMode === 'percent') {
         if (discountVal === '') {
           setError(t('orders.err_discount_pct'))
@@ -539,35 +812,51 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
 
   return (
     <Modal open={open} onClose={onClose} title={t('orders.new_order')} maxWidth="max-w-xl">
-      <form onSubmit={submit} className="space-y-4">
-        <div>
-          <p className="text-sm font-medium text-slate-700 mb-2">{t('orders.order_flow_label')}</p>
-          <div className="flex gap-2 flex-wrap">
-            <button
-              type="button"
-              onClick={() => setOrderFlow('dine_in')}
-              className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${
-                !isTakeaway
-                  ? 'bg-brand-500 text-white border-brand-500'
-                  : 'bg-white text-slate-600 border-border hover:bg-slate-50'
-              }`}
-            >
-              {t('orders.flow_dine_in')}
-            </button>
-            <button
-              type="button"
-              onClick={() => setOrderFlow('takeaway')}
-              className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${
-                isTakeaway
-                  ? 'bg-brand-500 text-white border-brand-500'
-                  : 'bg-white text-slate-600 border-border hover:bg-slate-50'
-              }`}
-            >
-              {t('orders.flow_takeaway')}
-            </button>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault()
+          submit(isTakeaway && payNow)
+        }}
+        className="space-y-4"
+      >
+        {!flowLocked && (
+          <div>
+            <p className="text-sm font-medium text-slate-700 mb-2">{t('orders.order_flow_label')}</p>
+            <div className="flex gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setOrderFlow('dine_in')}
+                className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${
+                  !isTakeaway
+                    ? 'bg-brand-500 text-white border-brand-500'
+                    : 'bg-white text-slate-600 border-border hover:bg-slate-50'
+                }`}
+              >
+                {t('orders.flow_dine_in')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setOrderFlow('takeaway')}
+                className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${
+                  isTakeaway
+                    ? 'bg-brand-500 text-white border-brand-500'
+                    : 'bg-white text-slate-600 border-border hover:bg-slate-50'
+                }`}
+              >
+                {t('orders.flow_takeaway')}
+              </button>
+            </div>
+            <p className="text-xs text-muted mt-2 leading-relaxed">{t('orders.order_flow_hint')}</p>
           </div>
-          <p className="text-xs text-muted mt-2 leading-relaxed">{t('orders.order_flow_hint')}</p>
-        </div>
+        )}
+        {flowLocked && (
+          <p className="text-sm text-slate-600">
+            <span className="font-medium">{isTakeaway ? t('orders.flow_takeaway') : t('orders.flow_dine_in')}</span>
+            {prefillTableId && !isTakeaway && (
+              <span className="text-muted"> — {t('orders.table', { n: tables.find((tb) => tb.id === prefillTableId)?.name ?? '' })}</span>
+            )}
+          </p>
+        )}
 
         {!isTakeaway &&
           (activeTables.length > 0 ? (
@@ -644,6 +933,74 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
           onChange={(e) => setNote(e.target.value)}
         />
 
+        {isTakeaway && (
+          <div className="rounded-xl border border-border px-4 py-3 space-y-3">
+            <div className="flex gap-2 flex-wrap">
+              <button
+                type="button"
+                onClick={() => setPayNow(false)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium border ${
+                  !payNow ? 'bg-brand-500 text-white border-brand-500' : 'bg-white text-slate-600 border-border'
+                }`}
+              >
+                {t('orders.takeaway_hold')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setPayNow(true)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium border ${
+                  payNow ? 'bg-brand-500 text-white border-brand-500' : 'bg-white text-slate-600 border-border'
+                }`}
+              >
+                {t('orders.takeaway_pay_now')}
+              </button>
+            </div>
+            <p className="text-xs text-muted leading-relaxed">
+              {payNow ? t('orders.takeaway_pay_now_hint') : t('orders.takeaway_hold_hint')}
+            </p>
+            {payNow && (
+              <>
+                <p className="text-sm font-semibold text-slate-700">{t('tables.payment_method_label')}</p>
+                {!openShift && (
+                  <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-800">
+                    {t('tables.no_open_shift')}{' '}
+                    <Link to="/cashier" className="font-semibold underline">{t('nav.cashier')}</Link>
+                  </div>
+                )}
+                <div className="flex flex-wrap gap-3">
+                  {PAYMENT_METHODS.map((m) => (
+                    <label key={m} className="flex items-center gap-1.5 text-sm cursor-pointer">
+                      <input
+                        type="radio"
+                        name="takeawayPayment"
+                        value={m}
+                        checked={paymentMethod === m}
+                        onChange={() => { setPaymentMethod(m); setMixedCash('') }}
+                        className="accent-brand-500"
+                      />
+                      {t(`tables.payment_${m}`)}
+                    </label>
+                  ))}
+                </div>
+                {paymentMethod === 'mixed' && (
+                  <div className="space-y-2">
+                    <label className="text-sm text-slate-600">{t('tables.mixed_cash_label')}</label>
+                    <MoneyInput value={mixedCash} onValueChange={setMixedCash} />
+                    {mixedCashNum > 0 && (
+                      <p className="text-sm text-slate-600">
+                        {t('tables.mixed_transfer_part', { amount: currency(mixedTransfer) })}
+                      </p>
+                    )}
+                    {grandTotal > 0 && mixedCashNum >= grandTotal && (
+                      <p className="text-xs text-red-600">{t('tables.mixed_cash_invalid')}</p>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        )}
+
         {error && (
           <p className="text-sm text-red-600 whitespace-pre-line leading-relaxed">{error}</p>
         )}
@@ -663,12 +1020,119 @@ function NewOrderModal({ open, onClose, t, defaultOrderFlow }) {
           ) : null}
           <div className="flex items-center justify-between gap-2">
             <p className="font-bold text-slate-800">{t('orders.total')} {currency(grandTotal)}</p>
-            <Button type="submit" disabled={submitBusy || (!isTakeaway && activeTables.length === 0)}>
-              {submitBusy ? t('orders.placing') : t('orders.place_order')}
+            <Button
+              type="submit"
+              disabled={
+                submitBusy
+                || (!isTakeaway && activeTables.length === 0)
+                || (isTakeaway && payNow && !canPayNow)
+              }
+            >
+              {submitBusy
+                ? t('orders.placing')
+                : isTakeaway
+                  ? (payNow ? t('orders.place_takeaway_pay') : t('orders.place_order'))
+                  : t('orders.place_order')}
             </Button>
           </div>
         </div>
       </form>
+    </Modal>
+  )
+}
+
+function TakeawayPayModal({ open, onClose, order, t }) {
+  const qc = useQueryClient()
+  const [paymentMethod, setPaymentMethod] = useState(DEFAULT_PAYMENT_METHOD)
+  const [mixedCash, setMixedCash] = useState('')
+  const [error, setError] = useState('')
+
+  const { data: openShift } = useQuery({
+    queryKey: ['cashier-shift'],
+    queryFn: getCurrentShift,
+    enabled: open,
+  })
+
+  useEffect(() => {
+    if (open) {
+      setPaymentMethod(DEFAULT_PAYMENT_METHOD)
+      setMixedCash('')
+      setError('')
+    }
+  }, [open])
+
+  const total = order ? orderTotals(order).total : 0
+  const mixedCashNum = mixedCash === '' ? 0 : Number(mixedCash)
+  const mixedTransfer = Math.max(total - mixedCashNum, 0)
+  const canConfirm =
+    !!openShift
+    && (paymentMethod !== 'mixed' || (mixedCashNum > 0 && mixedCashNum < total))
+
+  const mut = useMutation({
+    mutationFn: (body) => payTakeawayOrder(order.id, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['orders'] })
+      qc.invalidateQueries({ queryKey: ['cashier-shift'] })
+      onClose()
+    },
+    onError: (e) => setError(apiErr(e, t)),
+  })
+
+  if (!order) return null
+
+  return (
+    <Modal open={open} onClose={onClose} title={t('orders.pay_takeaway_title')} maxWidth="max-w-md">
+      <div className="space-y-4">
+        <p className="text-sm text-slate-700">
+          {t('orders.total')} <span className="font-bold">{currency(total)}</span>
+        </p>
+        {!openShift && (
+          <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-800">
+            {t('tables.no_open_shift')}{' '}
+            <Link to="/cashier" className="font-semibold underline">{t('nav.cashier')}</Link>
+          </div>
+        )}
+        <div className="flex flex-wrap gap-3">
+          {PAYMENT_METHODS.map((m) => (
+            <label key={m} className="flex items-center gap-1.5 text-sm cursor-pointer">
+              <input
+                type="radio"
+                name="takeawayPayLater"
+                value={m}
+                checked={paymentMethod === m}
+                onChange={() => { setPaymentMethod(m); setMixedCash('') }}
+                className="accent-brand-500"
+              />
+              {t(`tables.payment_${m}`)}
+            </label>
+          ))}
+        </div>
+        {paymentMethod === 'mixed' && (
+          <div className="space-y-2">
+            <label className="text-sm text-slate-600">{t('tables.mixed_cash_label')}</label>
+            <MoneyInput value={mixedCash} onValueChange={setMixedCash} />
+            {mixedCashNum > 0 && (
+              <p className="text-sm text-slate-600">
+                {t('tables.mixed_transfer_part', { amount: currency(mixedTransfer) })}
+              </p>
+            )}
+          </div>
+        )}
+        {error && <p className="text-sm text-red-600">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button variant="ghost" onClick={onClose}>{t('common.cancel')}</Button>
+          <Button
+            disabled={!canConfirm || mut.isPending}
+            onClick={() => {
+              const body = { payment_method: paymentMethod }
+              if (paymentMethod === 'mixed') body.cash_amount = mixedCashNum
+              mut.mutate(body)
+            }}
+          >
+            {mut.isPending ? t('tables.paying') : t('orders.pay_takeaway_btn')}
+          </Button>
+        </div>
+      </div>
     </Modal>
   )
 }
@@ -737,6 +1201,7 @@ function EditDiscountModal({ open, onClose, order, t }) {
     try {
       await patchOrderDiscount(order.id, body)
       qc.invalidateQueries({ queryKey: ['orders'] })
+      qc.invalidateQueries({ queryKey: ['table-orders'] })
       onClose()
     } catch (err) {
       setError(apiErr(err, t))
@@ -838,6 +1303,121 @@ function EditDiscountModal({ open, onClose, order, t }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+function EditPaymentModal({ open, onClose, order, t }) {
+  const qc = useQueryClient()
+  const [paymentMethod, setPaymentMethod] = useState(DEFAULT_PAYMENT_METHOD)
+  const [mixedCash, setMixedCash] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const { data: payment, isLoading } = useQuery({
+    queryKey: ['order-payment', order?.id],
+    queryFn: () => getOrderPayment(order.id),
+    enabled: open && !!order?.id,
+  })
+
+  useEffect(() => {
+    if (!payment) return
+    setPaymentMethod(payment.payment_method)
+    setMixedCash(
+      payment.payment_method === 'mixed' ? String(Number(payment.cash_amount)) : '',
+    )
+    setError('')
+  }, [payment?.id, payment?.payment_method, payment?.cash_amount])
+
+  const total = payment ? Number(payment.total_amount) : 0
+  const mixedCashNum = mixedCash === '' ? 0 : Number(mixedCash)
+  const mixedTransfer = Math.max(total - mixedCashNum, 0)
+  const canSave =
+    payment
+    && (paymentMethod !== 'mixed' || (mixedCashNum > 0 && mixedCashNum < total))
+
+  const submit = async (e) => {
+    e.preventDefault()
+    if (!payment || !canSave) return
+    setBusy(true)
+    setError('')
+    try {
+      const body = { payment_method: paymentMethod }
+      if (paymentMethod === 'mixed') body.cash_amount = mixedCashNum
+      await updatePayment(payment.id, body)
+      qc.invalidateQueries({ queryKey: ['cashier-shift'] })
+      qc.invalidateQueries({ queryKey: ['cashier-shifts'] })
+      qc.invalidateQueries({ queryKey: ['order-payment', order.id] })
+      onClose()
+    } catch (err) {
+      setError(apiErr(err, t))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!order) return null
+
+  const title =
+    order.order_flow === 'takeaway'
+      ? t('orders.payment_modal_title')
+      : `${t('orders.payment_modal_title')} — ${t('orders.table', { n: order.table_name ?? '' })}`
+
+  return (
+    <Modal open={open} onClose={onClose} title={title} maxWidth="max-w-md">
+      {isLoading ? (
+        <div className="py-10 flex justify-center"><Spinner /></div>
+      ) : !payment ? (
+        <p className="text-sm text-muted py-6 text-center">{t('orders.payment_not_found')}</p>
+      ) : (
+        <form onSubmit={submit} className="space-y-4">
+          <p className="text-sm text-slate-600">
+            {t('orders.payment_modal_total', { amount: currency(total) })}
+          </p>
+          <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+            {t('orders.payment_edit_warn')}
+          </p>
+          <div>
+            <p className="text-sm font-semibold text-slate-700 mb-2">{t('tables.payment_method_label')}</p>
+            <div className="flex flex-wrap gap-3">
+              {PAYMENT_METHODS.map((m) => (
+                <label key={m} className="flex items-center gap-1.5 text-sm cursor-pointer">
+                  <input
+                    type="radio"
+                    name="editPaymentMethod"
+                    value={m}
+                    checked={paymentMethod === m}
+                    onChange={() => { setPaymentMethod(m); setMixedCash('') }}
+                    className="accent-brand-500"
+                  />
+                  {t(`tables.payment_${m}`)}
+                </label>
+              ))}
+            </div>
+          </div>
+          {paymentMethod === 'mixed' && (
+            <div className="space-y-2">
+              <label className="text-sm text-slate-600">{t('tables.mixed_cash_label')}</label>
+              <MoneyInput value={mixedCash} onValueChange={setMixedCash} />
+              {mixedCashNum > 0 && (
+                <p className="text-sm text-slate-600">
+                  {t('tables.mixed_transfer_part', { amount: currency(mixedTransfer) })}
+                </p>
+              )}
+            </div>
+          )}
+          {error && <p className="text-sm text-red-600">{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <Button type="button" variant="secondary" onClick={onClose} disabled={busy}>
+              {t('common.cancel')}
+            </Button>
+            <Button type="submit" disabled={busy || !canSave}>
+              {busy ? t('common.saving') : t('common.save')}
+            </Button>
+          </div>
+        </form>
+      )}
+    </Modal>
+  )
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 function EditItemsModal({ open, onClose, order, t }) {
   const qc = useQueryClient()
   const [error, setError] = useState('')
@@ -853,12 +1433,13 @@ function EditItemsModal({ open, onClose, order, t }) {
       setCart({})
       return
     }
-    const raw = Object.fromEntries(order.details.map((d) => [d.item_id, d.qty]))
+    const raw = orderDetailsToCart(order.details)
     setCart(clampCartToMaxStock(raw, items))
   }, [order?.id, items])
 
-  const total = Object.entries(cart).reduce((s, [id, qty]) => {
+  const total = Object.keys(cart).reduce((s, id) => {
     const item = items.find((i) => i.id === id)
+    const qty = cartEntryQty(cart, id)
     return s + (item ? Number(item.price) * qty : 0)
   }, 0)
 
@@ -866,6 +1447,7 @@ function EditItemsModal({ open, onClose, order, t }) {
     mutationFn: (details) => updateOrderItems(order.id, details),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['orders'] })
+      qc.invalidateQueries({ queryKey: ['table-orders'] })
       qc.invalidateQueries({ queryKey: ['items', 'available'] })
       onClose()
       setError('')
@@ -875,7 +1457,7 @@ function EditItemsModal({ open, onClose, order, t }) {
   const submit = async (e) => {
     e.preventDefault()
     setError('')
-    const entries = Object.entries(cart)
+    const entries = Object.keys(cart).filter((id) => cartEntryQty(cart, id) > 0)
     if (entries.length === 0) { setError(t('orders.err_items')); return }
     setSubmitBusy(true)
     try {
@@ -886,13 +1468,13 @@ function EditItemsModal({ open, onClose, order, t }) {
       const fresh = qc.getQueryData(['items', 'available']) ?? items
       const nextCart = clampCartToMaxStock({ ...cart }, fresh)
       setCart(nextCart)
-      const details = Object.entries(nextCart).map(([item_id, qty]) => ({ item_id, qty }))
+      const details = cartToDetails(nextCart)
       if (details.length === 0) {
         setError(t('orders.err_items'))
         return
       }
-      for (const [id, qty] of Object.entries(nextCart)) {
-        const row = fresh.find((i) => i.id === id)
+      for (const d of details) {
+        const row = fresh.find((i) => i.id === d.item_id)
         if (!row || row.ingredients_available === false) {
           setError(t('orders.sold_out_ingredients'))
           return
@@ -901,7 +1483,7 @@ function EditItemsModal({ open, onClose, order, t }) {
           row.max_orderable_qty != null && row.max_orderable_qty !== undefined
             ? Math.max(0, Number(row.max_orderable_qty))
             : null
-        if (cap != null && qty > cap) {
+        if (cap != null && d.qty > cap) {
           setError(t('orders.err_qty_exceeds_stock', { name: row.name, n: cap }))
           return
         }
@@ -1005,15 +1587,34 @@ export default function Orders() {
   const { user } = useAuth()
   const canEdit  = user?.permissions?.includes('orders.edit')
   const canStart = user?.permissions?.includes('orders.start')
+  const canPay   = user?.permissions?.includes('tables.pay')
   const isSuperadmin = user?.role === 'superadmin'
   const qc = useQueryClient()
-  const [activeTab, setActiveTab]     = useState('pending')
-  const [tableFilter, setTableFilter] = useState('')
-  const [dateFrom, setDateFrom]       = useState(todayStr)
-  const [dateTo, setDateTo]           = useState(todayStr)
+  const [searchParams, setSearchParams] = useSearchParams()
+
+  const modeParam = searchParams.get('mode')
+  const mode = modeParam === 'dine_in' || modeParam === 'takeaway'
+    ? modeParam
+    : (user?.permissions?.includes('tables.view') || user?.permissions?.includes('orders.view')
+      ? 'dine_in'
+      : 'takeaway')
+
+  const setMode = (next) => {
+    const sp = new URLSearchParams(searchParams)
+    sp.set('mode', next)
+    setSearchParams(sp, { replace: true })
+  }
+
+  const [statusFilter, setStatusFilter] = useState('all') // 'open' | status key | 'all'
+  const [tableFilterId, setTableFilterId] = useState('')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
   const [newOrderOpen, setNewOrderOpen] = useState(false)
-  const [editOrder, setEditOrder]   = useState(null)
+  const [prefillTableId, setPrefillTableId] = useState('')
+  const [editOrder, setEditOrder] = useState(null)
   const [editDiscountOrder, setEditDiscountOrder] = useState(null)
+  const [editPaymentOrder, setEditPaymentOrder] = useState(null)
+  const [payTakeawayOrderState, setPayTakeawayOrderState] = useState(null)
   const [confirmDelOrder, setConfirmDelOrder] = useState(null)
   const [cancelCompletedOrder, setCancelCompletedOrder] = useState(null)
   const [cancelCompletedRestoreStock, setCancelCompletedRestoreStock] = useState(true)
@@ -1023,22 +1624,59 @@ export default function Orders() {
   const { data: allUsers = [] } = useQuery({ queryKey: ['all-users'], queryFn: getAllUsers })
   const usersMap = Object.fromEntries(allUsers.map((u) => [u.id, u.full_name]))
 
+  const { data: tables = [] } = useQuery({
+    queryKey: ['tables'],
+    queryFn: getTables,
+    enabled: mode === 'dine_in',
+  })
+
   const { data: orderFormDefaults } = useQuery({
     queryKey: ['order-form-defaults'],
     queryFn: getOrderFormDefaults,
     staleTime: 60_000,
   })
 
-  const { data, isLoading } = useQuery({
-    queryKey: ['orders', activeTab, dateFrom, dateTo],
-    queryFn: () => getOrders({ status: activeTab, limit: 200, date_from: dateFrom, date_to: dateTo }),
+  const statusesParam = useMemo(() => {
+    if (statusFilter === 'open') return OPEN_STATUSES
+    if (statusFilter === 'all') return undefined
+    return [statusFilter]
+  }, [statusFilter])
+
+  const orderQueryParams = useMemo(() => {
+    const params = {
+      order_flow: mode,
+      limit: 200,
+    }
+    if (statusesParam) params.status = statusesParam
+    if (dateFrom) params.date_from = dateFrom
+    if (dateTo) params.date_to = dateTo
+    if (mode === 'dine_in' && tableFilterId) params.table_id = tableFilterId
+    return params
+  }, [mode, statusesParam, dateFrom, dateTo, tableFilterId])
+
+  // Takeaway: always list. Dine-in: floor is primary; list when filtering by date/table/status≠all.
+  const showOrderList =
+    mode === 'takeaway'
+    || !!dateFrom
+    || !!dateTo
+    || !!tableFilterId
+    || statusFilter !== 'all'
+
+  const { data, isLoading: listLoading } = useQuery({
+    queryKey: ['orders', orderQueryParams],
+    queryFn: () => getOrders(orderQueryParams),
     refetchInterval: 15_000,
+    enabled: showOrderList || mode === 'takeaway',
   })
+
+  const orders = data?.items ?? []
 
   const mutation = useMutation({
     mutationFn: ({ id, status }) => updateStatus(id, status),
     onSuccess: (data) => {
       qc.invalidateQueries({ queryKey: ['orders'] })
+      qc.invalidateQueries({ queryKey: ['table-orders'] })
+      qc.invalidateQueries({ queryKey: ['tables'] })
       if (data?.deduction_warnings?.length) setDeductionWarnings(data.deduction_warnings)
     },
     onError: (e) => setMutErr(apiErr(e, t)),
@@ -1070,13 +1708,7 @@ export default function Orders() {
     },
   })
 
-  const tabIcon = { pending: Clock, in_progress: Utensils, delivered: Truck, completed: ChefHat, cancelled: Ban }
-
-  const orders = (data?.items ?? []).filter(
-    (o) => !tableFilter || (o.table_name ?? '').toLowerCase().includes(tableFilter.toLowerCase())
-  )
-
-  const isMultiDay = dateFrom !== dateTo
+  const isMultiDay = dateFrom && dateTo && dateFrom !== dateTo
   const ordersByDay = isMultiDay
     ? orders.reduce((acc, o) => {
         const day = new Date(o.created_at).toLocaleDateString('en-CA')
@@ -1086,96 +1718,145 @@ export default function Orders() {
       }, {})
     : null
 
+  const openNewOrder = (tableId = '') => {
+    setPrefillTableId(tableId)
+    setNewOrderOpen(true)
+  }
+
+  const renderOrderCard = (order) => (
+    <OrderCard
+      key={order.id}
+      order={order}
+      t={t}
+      canEdit={canEdit}
+      canStart={canStart}
+      canPay={canPay}
+      isSuperadmin={isSuperadmin}
+      usersMap={usersMap}
+      onAction={(id, status) => mutation.mutate({ id, status })}
+      onEditItems={(o) => setEditOrder(o)}
+      onEditDiscount={(o) => setEditDiscountOrder(o)}
+      onEditPayment={(o) => setEditPaymentOrder(o)}
+      onPayTakeaway={(o) => setPayTakeawayOrderState(o)}
+      onDelete={(id) => setConfirmDelOrder(id)}
+      onCancelCompleted={(o) => { setMutErr(''); setCancelCompletedRestoreStock(true); setCancelCompletedOrder(o) }}
+      onServeItem={(orderId, itemId, qty) => serveMut.mutate({ orderId, itemId, qty })}
+      servingItem={serveMut.isPending ? serveMut.variables : null}
+    />
+  )
+
   return (
     <Layout title={t('nav.orders')}>
       {isSuperadmin && (
         <OrderDefaultsPanel t={t} defaultFlow={orderFormDefaults?.default_order_flow} />
       )}
+
+      <div className="flex gap-1 bg-card rounded-lg border border-border p-1 mb-4 w-fit">
+        <button
+          type="button"
+          onClick={() => setMode('dine_in')}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            mode === 'dine_in' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-50'
+          }`}
+        >
+          <Armchair size={15} /> {t('orders.mode_dine_in')}
+        </button>
+        <button
+          type="button"
+          onClick={() => setMode('takeaway')}
+          className={`flex items-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium transition-colors ${
+            mode === 'takeaway' ? 'bg-brand-500 text-white' : 'text-slate-600 hover:bg-slate-50'
+          }`}
+        >
+          <ShoppingBag size={15} /> {t('orders.mode_takeaway')}
+        </button>
+      </div>
+
       <div className="flex flex-wrap gap-3 mb-5">
-        <div className="flex gap-1 bg-card rounded-lg border border-border p-1 flex-wrap">
-          {STATUS_TABS.map((s) => {
-            const Icon = tabIcon[s]
-            return (
-              <button
-                key={s}
-                onClick={() => setActiveTab(s)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                  activeTab === s
-                    ? 'bg-brand-500 text-white'
-                    : 'text-slate-600 hover:bg-slate-50'
-                }`}
-              >
-                <Icon size={14} />
-                {t(`orders.${s}`)}
-              </button>
-            )
-          })}
-        </div>
+        {/* Filters: takeaway = status + dates; dine-in = status + table + dates (all). Always visible on mobile. */}
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+          className="h-10 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500 w-full sm:w-auto"
+        >
+          <option value="all">{t('orders.filter_status_all')}</option>
+          <option value="open">{t('orders.filter_status_open')}</option>
+          {ALL_STATUSES.map((s) => (
+            <option key={s} value={s}>{t(`orders.${s}`)}</option>
+          ))}
+        </select>
 
-        <input
-          placeholder={t('orders.filter_table')}
-          value={tableFilter}
-          onChange={(e) => setTableFilter(e.target.value)}
-          className="h-10 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500 w-40"
-        />
+        {mode === 'dine_in' && (
+          <select
+            value={tableFilterId}
+            onChange={(e) => setTableFilterId(e.target.value)}
+            className="h-10 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500 w-full sm:w-auto"
+          >
+            <option value="">{t('orders.filter_table_all')}</option>
+            {tables.map((tb) => (
+              <option key={tb.id} value={tb.id}>{tb.name}</option>
+            ))}
+          </select>
+        )}
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
           <label className="text-sm text-slate-600">{t('common.from')}</label>
           <input
             type="date"
             value={dateFrom}
             onChange={(e) => setDateFrom(e.target.value)}
-            className="h-10 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500"
+            className="h-10 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500 min-w-0 flex-1 sm:flex-none"
           />
           <label className="text-sm text-slate-600">{t('common.to')}</label>
           <input
             type="date"
             value={dateTo}
-            min={dateFrom}
+            min={dateFrom || undefined}
             onChange={(e) => setDateTo(e.target.value)}
-            className="h-10 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500"
+            className="h-10 rounded-lg border border-border px-3 text-sm outline-none focus:border-brand-500 min-w-0 flex-1 sm:flex-none"
           />
-          {(dateFrom !== todayStr() || dateTo !== todayStr()) && (
+          {(dateFrom || dateTo) && (
             <button
               type="button"
-              onClick={() => { setDateFrom(todayStr()); setDateTo(todayStr()) }}
+              onClick={() => { setDateFrom(''); setDateTo('') }}
               className="text-sm text-brand-500 hover:underline"
             >
-              {t('common.today')}
+              {t('orders.clear_dates')}
             </button>
           )}
         </div>
 
-        {canEdit && (
-          <Button onClick={() => setNewOrderOpen(true)} className="ml-auto">
+        {canEdit && mode === 'takeaway' && (
+          <Button onClick={() => openNewOrder('')} className="ml-auto">
             <Plus size={16} /> {t('orders.new_order')}
           </Button>
         )}
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() => {
-            const cols = [
-              { key: 'order_flow', label: t('orders.csv_flow') },
-              { key: 'table_name', label: t('orders.table', { n: '' }).trim() },
-              { key: 'status', label: 'Status' },
-              { key: 'created_at', label: t('inv.col_when'), render: (r) => new Date(r.created_at).toLocaleString() },
-              { key: 'total', label: t('orders.total'), render: (r) => orderTotals(r).total },
-            ]
-            exportCsv(`orders-${dateFrom}.csv`, orders, cols)
-          }}
-          disabled={orders.length === 0}
-        >
-          <Download size={14} /> {t('common.export')}
-        </Button>
+        {showOrderList && (
+          <Button
+            variant="secondary"
+            size="sm"
+            className={mode === 'dine_in' || !canEdit ? 'ml-auto' : ''}
+            onClick={() => {
+              const cols = [
+                { key: 'order_flow', label: t('orders.csv_flow') },
+                { key: 'table_name', label: t('orders.table', { n: '' }).trim() },
+                { key: 'status', label: 'Status' },
+                { key: 'created_at', label: t('inv.col_when'), render: (r) => new Date(r.created_at).toLocaleString() },
+                { key: 'total', label: t('orders.total'), render: (r) => orderTotals(r).total },
+              ]
+              exportCsv(`orders-${dateFrom || todayStr()}.csv`, orders, cols)
+            }}
+            disabled={orders.length === 0}
+          >
+            <Download size={14} /> {t('common.export')}
+          </Button>
+        )}
       </div>
-
-      {isLoading && <Spinner />}
 
       {mutErr && (
         <div className="mb-4 rounded-lg bg-red-50 border border-red-200 px-4 py-2 text-sm text-red-600 flex justify-between">
           <span>{mutErr}</span>
-          <button onClick={() => setMutErr('')} className="ml-4 font-bold">×</button>
+          <button type="button" onClick={() => setMutErr('')} className="ml-4 font-bold">×</button>
         </div>
       )}
 
@@ -1186,72 +1867,63 @@ export default function Orders() {
               <p key={i}>{t('orders.deduction_warn', { msg: w })}</p>
             ))}
           </div>
-          <button onClick={() => setDeductionWarnings([])} className="ml-4 font-bold">×</button>
+          <button type="button" onClick={() => setDeductionWarnings([])} className="ml-4 font-bold">×</button>
         </div>
       )}
 
-      {!isLoading && orders.length === 0 && (
-        <div className="text-center py-20 text-muted text-sm">
-          {t('orders.no_orders', { status: t(`orders.${activeTab}`).toLowerCase() })}
+      {mode === 'dine_in' && !dateFrom && !dateTo && (
+        <div className="mb-6">
+          <DineInFloor
+            t={t}
+            tableFilterId={tableFilterId}
+            onCreateOrder={(tableId) => openNewOrder(tableId)}
+            onEditOrder={(order) => {
+              setEditOrder(order)
+            }}
+          />
         </div>
       )}
 
-      {isMultiDay ? (
-        <div className="space-y-6">
-          {Object.keys(ordersByDay).sort((a, b) => b.localeCompare(a)).map((day) => (
-            <div key={day}>
-              <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-3">{fmtDayHeader(day)}</p>
-              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
-                {ordersByDay[day].map((order) => (
-                  <OrderCard
-                    key={order.id}
-                    order={order}
-                    t={t}
-                    canEdit={canEdit}
-                    canStart={canStart}
-                    isSuperadmin={isSuperadmin}
-                    usersMap={usersMap}
-                    onAction={(id, status) => mutation.mutate({ id, status })}
-                    onEditItems={(o) => setEditOrder(o)}
-                    onEditDiscount={(o) => setEditDiscountOrder(o)}
-                    onDelete={(id) => setConfirmDelOrder(id)}
-                    onCancelCompleted={(o) => { setMutErr(''); setCancelCompletedRestoreStock(true); setCancelCompletedOrder(o) }}
-                    onServeItem={(orderId, itemId, qty) => serveMut.mutate({ orderId, itemId, qty })}
-                    servingItem={serveMut.isPending ? serveMut.variables : null}
-                  />
-                ))}
-              </div>
+      {showOrderList && (
+        <>
+          {listLoading && <Spinner />}
+          {!listLoading && orders.length === 0 && (
+            <div className="text-center py-12 text-muted text-sm">
+              {t('orders.no_orders_generic')}
             </div>
-          ))}
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
-          {orders.map((order) => (
-            <OrderCard
-              key={order.id}
-              order={order}
-              t={t}
-              canEdit={canEdit}
-              canStart={canStart}
-              isSuperadmin={isSuperadmin}
-              usersMap={usersMap}
-              onAction={(id, status) => mutation.mutate({ id, status })}
-              onEditItems={(o) => setEditOrder(o)}
-              onEditDiscount={(o) => setEditDiscountOrder(o)}
-              onDelete={(id) => setConfirmDelOrder(id)}
-              onCancelCompleted={(o) => { setMutErr(''); setCancelCompletedRestoreStock(true); setCancelCompletedOrder(o) }}
-              onServeItem={(orderId, itemId, qty) => serveMut.mutate({ orderId, itemId, qty })}
-              servingItem={serveMut.isPending ? serveMut.variables : null}
-            />
-          ))}
-        </div>
+          )}
+          {isMultiDay ? (
+            <div className="space-y-6">
+              {Object.keys(ordersByDay).sort((a, b) => b.localeCompare(a)).map((day) => (
+                <div key={day}>
+                  <p className="text-xs font-semibold text-muted uppercase tracking-wide mb-3">{fmtDayHeader(day)}</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+                    {ordersByDay[day].map(renderOrderCard)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+              {orders.map(renderOrderCard)}
+            </div>
+          )}
+        </>
       )}
 
       <NewOrderModal
         open={newOrderOpen}
-        onClose={() => setNewOrderOpen(false)}
+        onClose={() => { setNewOrderOpen(false); setPrefillTableId('') }}
         t={t}
         defaultOrderFlow={orderFormDefaults?.default_order_flow}
+        forceFlow={mode}
+        prefillTableId={prefillTableId}
+      />
+      <TakeawayPayModal
+        open={!!payTakeawayOrderState}
+        onClose={() => setPayTakeawayOrderState(null)}
+        order={payTakeawayOrderState}
+        t={t}
       />
       <EditItemsModal open={!!editOrder} onClose={() => setEditOrder(null)} order={editOrder} t={t} />
       <EditDiscountModal
@@ -1260,8 +1932,13 @@ export default function Orders() {
         order={editDiscountOrder}
         t={t}
       />
+      <EditPaymentModal
+        open={!!editPaymentOrder}
+        onClose={() => setEditPaymentOrder(null)}
+        order={editPaymentOrder}
+        t={t}
+      />
 
-      {/* Delete cancelled order confirmation */}
       <Modal open={!!confirmDelOrder} onClose={() => setConfirmDelOrder(null)} title="">
         <p className="text-sm text-slate-700 mb-6">{t('orders.delete_confirm')}</p>
         <div className="flex justify-end gap-3">
@@ -1275,7 +1952,6 @@ export default function Orders() {
         </div>
       </Modal>
 
-      {/* Cancel completed (superadmin only) confirmation */}
       <Modal
         open={!!cancelCompletedOrder}
         onClose={() => { setCancelCompletedOrder(null); setCancelCompletedRestoreStock(true) }}

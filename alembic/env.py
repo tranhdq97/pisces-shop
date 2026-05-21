@@ -30,6 +30,7 @@ import app.modules.recipes.models  # noqa: F401
 import app.modules.financials.models  # noqa: F401
 import app.modules.suppliers.models  # noqa: F401
 import app.modules.about.models  # noqa: F401
+import app.modules.cashier.models  # noqa: F401
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)

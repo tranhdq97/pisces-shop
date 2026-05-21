@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { Eye, EyeOff } from 'lucide-react'
 import AppLogo from '../components/AppLogo'
@@ -8,8 +8,14 @@ import Input from '../components/Input'
 import Button from '../components/Button'
 import { apiErr } from '../api/apiErr'
 
+function loginRedirectPath(user) {
+  if (!user.is_approved) return '/sop'
+  if (['superadmin', 'admin', 'manager'].includes(user.role)) return '/'
+  return '/orders'
+}
+
 export default function Login() {
-  const { login } = useAuth()
+  const { login, user, loading: authLoading } = useAuth()
   const { t } = useT()
   const navigate = useNavigate()
   const [email, setEmail] = useState('')
@@ -18,18 +24,19 @@ export default function Login() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
+  // Already signed in — skip the login form (e.g. reopening the app with a valid cookie).
+  useEffect(() => {
+    if (authLoading || !user) return
+    navigate(loginRedirectPath(user), { replace: true })
+  }, [authLoading, user, navigate])
+
   const handleSubmit = async (e) => {
     e.preventDefault()
     setError('')
     setLoading(true)
     try {
-      const user = await login(email, password)
-      if (!user.is_approved) {
-        navigate('/sop')
-        return
-      }
-      if (['superadmin', 'admin', 'manager'].includes(user.role)) navigate('/')
-      else navigate('/orders')
+      const loggedIn = await login(email, password)
+      navigate(loginRedirectPath(loggedIn))
     } catch (err) {
       setError(apiErr(err, t))
     } finally {

@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect } from 'react'
 import { getMe, login as apiLogin } from '../api/auth'
+import { clearToken, getToken, setToken } from '../api/authToken'
 import { SESSION_EXPIRED_EVENT } from '../api/client'
 
 const AuthContext = createContext(null)
@@ -15,9 +16,9 @@ export function AuthProvider({ children }) {
     return () => window.removeEventListener(SESSION_EXPIRED_EVENT, onExpired)
   }, [])
 
-  // Restore session on mount
+  // Restore session on mount when auth cookie is still valid.
   useEffect(() => {
-    const token = localStorage.getItem('token')?.trim()
+    const token = getToken()
     if (!token) {
       setLoading(false)
       return
@@ -25,7 +26,7 @@ export function AuthProvider({ children }) {
     getMe()
       .then(setUser)
       .catch(() => {
-        localStorage.removeItem('token')
+        clearToken()
         setUser(null)
       })
       .finally(() => setLoading(false))
@@ -33,14 +34,14 @@ export function AuthProvider({ children }) {
 
   const login = async (email, password) => {
     const { access_token } = await apiLogin(email, password)
-    localStorage.setItem('token', access_token)
+    setToken(access_token)
     const me = await getMe()
     setUser(me)
     return me
   }
 
   const logout = () => {
-    localStorage.removeItem('token')
+    clearToken()
     setUser(null)
   }
 

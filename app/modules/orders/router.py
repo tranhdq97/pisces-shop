@@ -9,18 +9,22 @@ from app.core.locale import preferred_locale_from_accept_language
 from app.core.exceptions import AppException
 from app.core.permissions import Permission
 from app.core.security import require_approved_user, require_permission, require_roles
-from app.modules.orders.models import OrderStatus
 from app.modules.orders.schemas import (
     OrderCreate,
     OrderFormDefaults,
     OrderFormDefaultsWrite,
     OrderListResponse,
+    OrderPay,
     OrderRead,
     OrderServeItem,
     OrderUpdateDiscount,
     OrderUpdateItems,
     OrderUpdateStatus,
 )
+from app.modules.cashier.router import _payment_to_read
+from app.modules.cashier.schemas import PaymentRead
+from app.modules.cashier.service import CashierService
+from app.modules.orders.models import OrderFlow, OrderStatus
 from app.modules.orders.service import OrderService
 from app.modules.orders.shop_settings_service import ShopSettingsService
 
@@ -67,8 +71,9 @@ async def create_order(
 
 @router.get("", response_model=OrderListResponse)
 async def list_orders(
-    order_status: OrderStatus | None = Query(default=None, alias="status"),
+    order_status: list[OrderStatus] | None = Query(default=None, alias="status"),
     table_id: uuid.UUID | None = Query(default=None),
+    order_flow: OrderFlow | None = Query(default=None),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
@@ -78,8 +83,9 @@ async def list_orders(
 ) -> OrderListResponse:
     service = OrderService(db)
     total, orders = await service.list_orders(
-        status=order_status,
+        statuses=order_status or None,
         table_id=table_id,
+        order_flow=order_flow,
         date_from=date_from,
         date_to=date_to,
         skip=skip,
@@ -100,6 +106,41 @@ async def get_order(
     service = OrderService(db)
     order = await service.get_order(order_id)
     return OrderRead.model_validate(order)
+
+
+@router.post(
+    "/{order_id}/pay",
+    response_model=OrderRead,
+    dependencies=[Depends(require_permission(Permission.TABLES_PAY))],
+)
+async def pay_takeaway_order(
+    order_id: uuid.UUID,
+    payload: OrderPay,
+    db: AsyncSession = Depends(get_db),
+) -> OrderRead:
+    """Pay a takeaway order (open cashier shift required). Marks order COMPLETED."""
+    order = await OrderService(db).pay_takeaway(order_id, payload)
+    return OrderRead.model_validate(order)
+
+
+@router.get(
+    "/{order_id}/payment",
+    response_model=PaymentRead,
+    dependencies=[Depends(require_roles("superadmin"))],
+)
+async def get_order_payment(
+    order_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> PaymentRead:
+    order = await OrderService(db).get_order(order_id)
+    if order.status != OrderStatus.COMPLETED:
+        raise AppException(
+            status_code=409,
+            detail="Payment is only available for completed (paid) orders.",
+            code="order_not_paid",
+        )
+    payment = await CashierService(db).get_payment_for_order(order_id)
+    return _payment_to_read(payment)
 
 
 @router.patch("/{order_id}/status", response_model=OrderRead)

@@ -31,3 +31,11 @@ class TableWithStatus(TableRead):
     occupied_since: datetime | None
     active_order_count: int
     total_items: int
+
+
+class TablePayResponse(TableRead):
+    payment_id: uuid.UUID
+    total_amount: float
+    cash_amount: float
+    transfer_amount: float
+    payment_method: str
